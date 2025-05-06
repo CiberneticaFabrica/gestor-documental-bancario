@@ -1,0 +1,679 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Gestor Documental Bancario - Sistema de Procesamiento Automático Optimizado
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 1024
+    Runtime: python3.9
+    Tracing: Active
+    Environment:
+      Variables:
+        LOG_LEVEL: INFO
+        DB_HOST: !Ref DBHost
+        DB_NAME: !Ref DBName
+        DB_USER: !Ref DBUser
+        DB_PASSWORD: !Ref DBPassword
+
+Parameters:
+  DBHost:
+    Type: String
+    Default: fabrica-gestor-documental.c642nkfthejp.us-east-1.rds.amazonaws.com
+    Description: RDS Host Address
+  
+  DBName:
+    Type: String
+    Default: fabrica-gestor-documental
+    Description: Database Name
+  
+  DBUser:
+    Type: String
+    Default: admin
+    Description: Database Username
+  
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Description: Database Password
+  
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where the Lambda functions will run
+  
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet::Id
+    Description: First private subnet for Lambda functions
+  
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Second private subnet for Lambda functions
+
+Resources:
+  # Capa compartida
+  CommonLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: gestor-documental-common
+      Description: Shared libraries and utilities
+      ContentUri: src/common_layer/
+      CompatibleRuntimes:
+        - python3.9
+      RetentionPolicy: Retain
+
+  # Lambda Functions - Creamos las funciones primero
+  DocumentUploadProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/upload_processor/
+      Handler: app.lambda_handler
+      Description: Procesa documentos recién cargados y los envía para clasificación
+      Timeout: 300
+      Layers:
+        - !Ref CommonLayer
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+                - s3:ListBucket
+              Resource: 
+                - !Sub "arn:aws:s3:::${AWS::StackName}-documents-input"
+                - !Sub "arn:aws:s3:::${AWS::StackName}-documents-input/*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+                - s3:ListBucket
+              Resource: 
+                - !Sub "arn:aws:s3:::${AWS::StackName}-documents-processed"
+                - !Sub "arn:aws:s3:::${AWS::StackName}-documents-processed/*"
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt DocumentClassificationQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - textract:StartDocumentAnalysis
+                - textract:StartDocumentTextDetection
+              Resource: '*'
+        - VPCAccessPolicy: {}
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          CLASSIFICATION_QUEUE_URL: !Ref DocumentClassificationQueue
+          PROCESSED_BUCKET: !Sub "${AWS::StackName}-documents-processed"
+          TEXTRACT_SNS_TOPIC: !Ref TextractCompletionTopic
+          TEXTRACT_ROLE_ARN: !GetAtt TextractSNSRole.Arn
+
+  # Permiso para permitir que S3 invoque la función Lambda
+  DocumentUploadProcessorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DocumentUploadProcessorFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::${AWS::StackName}-documents-input"
+
+  # S3 Buckets
+  DocumentsInputBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: DocumentUploadProcessorPermission
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-documents-input
+      VersioningConfiguration:
+        Status: Enabled
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST, DELETE]
+            AllowedOrigins: ['*']
+            MaxAge: 3600
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: incoming/
+            Function: !GetAtt DocumentUploadProcessorFunction.Arn
+
+  DocumentsProcessedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-documents-processed
+      VersioningConfiguration:
+        Status: Enabled
+
+  # SQS Queues
+  DocumentClassificationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-document-classification-queue
+      VisibilityTimeout: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DocumentClassificationDLQ.Arn
+        maxReceiveCount: 3
+
+  DocumentClassificationDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-document-classification-dlq
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  IdDocumentProcessorQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-id-document-queue
+      VisibilityTimeout: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IdDocumentProcessorDLQ.Arn
+        maxReceiveCount: 3
+
+  IdDocumentProcessorDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-id-document-dlq
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  ContractProcessorQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-contract-queue
+      VisibilityTimeout: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ContractProcessorDLQ.Arn
+        maxReceiveCount: 3
+
+  ContractProcessorDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-contract-dlq
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  FinancialProcessorQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-financial-queue
+      VisibilityTimeout: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt FinancialProcessorDLQ.Arn
+        maxReceiveCount: 3
+
+  FinancialProcessorDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-financial-dlq
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  # Tema SNS para notificaciones de Textract
+  TextractCompletionTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "Textract Completion Notifications"
+      TopicName: !Sub "${AWS::StackName}-textract-completion"
+
+  # IAM Roles y Security Group
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Lambda functions to access RDS
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  # Rol para permitir a Textract publicar en SNS
+  TextractSNSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: textract.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonTextractFullAccess
+      Policies:
+        - PolicyName: TextractSNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref TextractCompletionTopic
+        - PolicyName: TextractS3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-documents-processed/*"
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-documents-input/*"
+
+  # Clasificador optimizado (solo "enrutador inteligente")
+  DocumentClassifierFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/document_classifier/
+      Handler: app.lambda_handler
+      Description: Clasifica documentos según su tipo (optimizado)
+      Timeout: 30
+      MemorySize: 512  # Reducido ya que solo actúa como enrutador
+      Layers:
+        - !Ref CommonLayer
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt DocumentClassificationQueue.Arn
+            BatchSize: 1
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt IdDocumentProcessorQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ContractProcessorQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt FinancialProcessorQueue.QueueName
+        - VPCAccessPolicy: {}
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          ID_PROCESSOR_QUEUE_URL: !Ref IdDocumentProcessorQueue
+          CONTRACT_PROCESSOR_QUEUE_URL: !Ref ContractProcessorQueue
+          FINANCIAL_PROCESSOR_QUEUE_URL: !Ref FinancialProcessorQueue
+          DEFAULT_PROCESSOR_QUEUE_URL: !Ref ContractProcessorQueue
+
+  # Procesador de documentos de identidad optimizado
+  IdDocumentProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/processors/id_processor/
+      Handler: app.lambda_handler
+      Description: Procesa documentos de identidad (optimizado)
+      Timeout: 30  # Reducido ya que no llama a Textract
+      MemorySize: 512  # Reducido ya que solo procesa datos ya extraídos
+      Layers:
+        - !Ref CommonLayer
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt IdDocumentProcessorQueue.Arn
+            BatchSize: 1
+      Policies:
+        # Ya no necesita acceso a S3 ni servicios de AWS ML
+        - VPCAccessPolicy: {}
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+
+  # Procesador de contratos optimizado
+  ContractProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/processors/contract_processor/
+      Handler: app.lambda_handler
+      Description: Procesa documentos de contratos bancarios (optimizado)
+      Timeout: 60  # Reducido ya que no llama a Textract
+      MemorySize: 512  # Reducido ya que solo procesa datos ya extraídos
+      Layers:
+        - !Ref CommonLayer
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ContractProcessorQueue.Arn
+            BatchSize: 1
+      Policies:
+        - VPCAccessPolicy: {}
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+
+  # Procesador financiero optimizado
+  FinancialProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/processors/financial_processor/
+      Handler: app.lambda_handler
+      Description: Procesa documentos financieros bancarios (optimizado)
+      Timeout: 30  # Reducido ya que no llama a Textract
+      MemorySize: 512  # Reducido ya que solo procesa datos ya extraídos
+      Layers:
+        - !Ref CommonLayer
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt FinancialProcessorQueue.Arn
+            BatchSize: 1
+      Policies:
+        - VPCAccessPolicy: {}
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+
+  # Procesador central de Textract
+  TextractCallbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/textract_callback/
+      Handler: app.lambda_handler
+      Description: Procesa resultados de Textract y extrae datos completos
+      Timeout: 120  # Mayor timeout para procesamiento exhaustivo
+      MemorySize: 1536  # Mayor memoria para procesamiento
+      Layers:
+        - !Ref CommonLayer
+      Events:
+        SNSEvent:
+          Type: SNS
+          Properties:
+            Topic: !Ref TextractCompletionTopic
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref DocumentsProcessedBucket
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt DocumentClassificationQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt IdDocumentProcessorQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ContractProcessorQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt FinancialProcessorQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - textract:GetDocumentAnalysis
+                - textract:GetDocumentTextDetection
+                - comprehend:DetectEntities
+                - comprehend:DetectKeyPhrases
+                - comprehend:ClassifyDocument
+              Resource: '*'
+        - VPCAccessPolicy: {}
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          DOCUMENT_CLASSIFIER_QUEUE_URL: !Ref DocumentClassificationQueue
+          CONTRACT_PROCESSOR_QUEUE_URL: !Ref ContractProcessorQueue
+          ID_PROCESSOR_QUEUE_URL: !Ref IdDocumentProcessorQueue
+          FINANCIAL_PROCESSOR_QUEUE_URL: !Ref FinancialProcessorQueue
+          DEFAULT_PROCESSOR_QUEUE_URL: !Ref DocumentClassificationQueue
+          PROCESSED_BUCKET: !Ref DocumentsProcessedBucket
+
+  ClientViewAggregatorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/client_view_aggregator/
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      MemorySize: 256
+      Timeout: 60
+      Environment:
+        Variables:
+          DB_HOST: !Ref DBHost
+          DB_NAME: !Ref DBName
+          DB_USER: !Ref DBUser
+          DB_PASSWORD: !Ref DBPassword
+          LOG_LEVEL: INFO
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - events:PutEvents
+              Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default"
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+      Layers:
+        - !Ref CommonLayer
+      Tags:
+        Component: ClientViewAggregator
+
+  DocumentExpiryMonitorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/document_expiry_monitor/
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          DB_HOST: !Ref DBHost
+          DB_NAME: !Ref DBName
+          DB_USER: !Ref DBUser
+          DB_PASSWORD: !Ref DBPassword
+          NOTIFICATION_TOPIC_ARN: !Ref DocumentExpiryNotificationTopic
+          EMAIL_TEMPLATE_BUCKET: !Ref DocumentsProcessedBucket
+          EMAIL_TEMPLATE_KEY_PREFIX: templates/email/
+          SOURCE_EMAIL: epenalbadev@hotmail.com  # Dirección remitente verificada en SES
+      Events:
+        DailyCheck:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 8 * * ? *)  # Ejecutar todos los días a las 8:00 AM UTC
+            Description: Verificación diaria de documentos por vencer
+            Enabled: true
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+      Layers:
+        - !Ref CommonLayer
+      Policies:
+        - VPCAccessPolicy: {}
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !Ref DocumentExpiryNotificationTopic
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub "arn:aws:s3:::${DocumentsProcessedBucket}/templates/email/*"
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: "*"
+
+  DocumentExpiryNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: DocumentExpiryNotifications
+      Tags:
+        - Key: Purpose
+          Value: Document expiry notifications
+
+  ClientViewAggregatorSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Ejecuta ClientViewAggregator diariamente para mantener actualizadas las vistas de cliente
+      ScheduleExpression: "cron(0 2 * * ? *)"  # Ejecuta diariamente a las 2 AM UTC
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ClientViewAggregatorFunction.Arn
+          Id: "ClientViewAggregatorScheduleTarget"
+
+  ClientViewAggregatorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ClientViewAggregatorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ClientViewAggregatorSchedule.Arn
+
+  # ManualReviewHandler Function
+  ManualReviewHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/manual_review_handler/
+      Handler: app.lambda_handler
+      Description: Gestiona el proceso de revisión manual de documentos
+      Timeout: 30
+      MemorySize: 512
+      Layers:
+        - !Ref CommonLayer
+      Environment:
+        Variables:
+          DOCUMENTS_BUCKET: !Ref DocumentsProcessedBucket
+          MODEL_TRAINING_QUEUE_URL: !Ref ModelTrainingQueue
+          NOTIFICATION_TOPIC_ARN: !Ref DocumentNotificationTopic
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref DocumentsProcessedBucket
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ModelTrainingQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !Ref DocumentNotificationTopic
+        - VPCAccessPolicy: {}
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Events:
+        GetPendingReviewsAPI:
+          Type: Api
+          Properties:
+            Path: /documents/pending-review
+            Method: get
+        GetDocumentForReviewAPI:
+          Type: Api
+          Properties:
+            Path: /documents/review/{document_id}
+            Method: get
+        SubmitReviewAPI:
+          Type: Api
+          Properties:
+            Path: /documents/review/{document_id}
+            Method: post
+        GetReviewStatsAPI:
+          Type: Api
+          Properties:
+            Path: /documents/review-stats
+            Method: get
+
+  # Cola para entrenamiento de modelos (si no existe ya)
+  ModelTrainingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-model-training-queue
+      VisibilityTimeout: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ModelTrainingDLQ.Arn
+        maxReceiveCount: 3
+
+  ModelTrainingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-model-training-dlq
+      MessageRetentionPeriod: 1209600 # 14 días
+
+  # Tópico SNS para notificaciones de documentos
+  DocumentNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "Notificaciones de Documentos"
+      TopicName: !Sub "${AWS::StackName}-document-notifications"
+
+Outputs:
+  DocumentsInputBucketName:
+    Description: "Bucket for document uploads"
+    Value: !Ref DocumentsInputBucket
+  
+  DocumentsProcessedBucketName:
+    Description: "Bucket for processed documents"
+    Value: !Ref DocumentsProcessedBucket
+  
+  DocumentUploadProcessorFunction:
+    Description: "Document Upload Processor Lambda Function ARN"
+    Value: !GetAtt DocumentUploadProcessorFunction.Arn
+  
+  DocumentClassifierFunction:
+    Description: "Document Classifier Lambda Function ARN"
+    Value: !GetAtt DocumentClassifierFunction.Arn
+  
+  IdDocumentProcessorFunction:
+    Description: "ID Document Processor Lambda Function ARN"
+    Value: !GetAtt IdDocumentProcessorFunction.Arn
+  
+  ContractProcessorFunction:
+    Description: "Contract Processor Lambda Function ARN"
+    Value: !GetAtt ContractProcessorFunction.Arn
+  
+  FinancialProcessorFunction:
+    Description: "Financial Document Processor Lambda Function ARN"
+    Value: !GetAtt FinancialProcessorFunction.Arn
+  
+  TextractCallbackFunction:
+    Description: "Textract Callback Lambda Function ARN"
+    Value: !GetAtt TextractCallbackFunction.Arn
+  
+  TextractCompletionTopicARN:
+    Description: "Textract Completion Topic ARN"
+    Value: !Ref TextractCompletionTopic
+  
+  DocumentNotificationTopicARN:
+    Description: "Document Notifications Topic ARN"
+    Value: !Ref DocumentNotificationTopic
+    
+  ManualReviewHandlerFunction:
+    Description: "Manual Review Handler Lambda Function ARN"
+    Value: !GetAtt ManualReviewHandlerFunction.Arn
+
+  ManualReviewHandlerApi:
+    Description: "API Gateway URL for Manual Review Handler"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"

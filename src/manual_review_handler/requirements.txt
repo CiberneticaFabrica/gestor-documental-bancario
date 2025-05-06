@@ -1,0 +1,4 @@
+boto3>=1.26.0
+pymysql>=1.0.2
+python-dateutil>=2.8.2
+# Las dependencias comunes estarán disponibles a través de la capa compartida
