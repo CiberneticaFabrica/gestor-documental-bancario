@@ -22,9 +22,11 @@ from common.db_connector import (
     insert_analysis_record,
     update_analysis_record,
     generate_uuid,
-    link_document_to_client
+    link_document_to_client,
+    assign_folder_and_link,
+    get_client_id_by_document
 )
-
+ 
 from contract_parser import extract_contract_data, validate_contract_data, format_date, extract_clauses_by_section
 
 # Configurar el logger
@@ -437,8 +439,18 @@ def lambda_handler(event, context):
             
             logger.info(f"Procesando contrato {document_id}")
             
+     
+            
             document_data_result = get_extracted_data_from_db(document_id)
             
+            # Obtener tipo_documento si existe
+            tipo_detectado = document_data_result['extracted_data'].get('tipo_documento_detectado', 'contrato')
+
+            # Asignar carpeta y marcar documento solicitado como recibido
+            cliente_id = get_client_id_by_document(document_id)
+            assign_folder_and_link(cliente_id,document_id)
+            logger.info(f"Procesando contrato Asignar carpeta y marcar documento solicitado como recibido {document_id}")
+
             if not document_data_result:
                 logger.error(f"No se pudieron recuperar datos del documento {document_id}")
                 documento_detalle['estado'] = 'error_recuperacion_datos'

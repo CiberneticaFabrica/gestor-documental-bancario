@@ -20,9 +20,12 @@ from common.db_connector import (
     get_document_by_id,
     insert_analysis_record,
     generate_uuid,
-    link_document_to_client
+    link_document_to_client,
+    assign_folder_and_link,
+    get_client_id_by_document
 )
 from financial_parser import parse_financial_document, extract_transactions
+ 
 
 # Configurar el logger
 logger = logging.getLogger()
@@ -484,6 +487,7 @@ def lambda_handler(event, context):
             
             logger.info(f"Procesando documento financiero {document_id}")
             
+      
             # Paso 1: Obtener datos ya extraídos de la base de datos
             document_data_result = get_extracted_data_from_db(document_id)
             
@@ -493,6 +497,14 @@ def lambda_handler(event, context):
                 response['errores'] += 1
                 continue
             
+            # Paso 0: Obtener tipo_documento antes de asignar carpeta
+            tipo_detectado = document_data_result['extracted_data'].get('tipo_documento_detectado', 'financiero')
+
+            # Asignar carpeta y marcar documento solicitado como recibido
+            cliente_id = get_client_id_by_document(document_id)
+            assign_folder_and_link(cliente_id,document_id)
+            logger.info(f"Procesando documento financiero Asignar carpeta y marcar documento solicitado como recibido {document_id}")
+ 
             # Paso 2: Procesar los datos financieros
             process_result = process_financial_data(
                 document_id, 

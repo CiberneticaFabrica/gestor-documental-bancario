@@ -42,7 +42,8 @@ try:
     from common.db_connector import (
         insert_document, insert_document_version, insert_analysis_record, 
         generate_uuid, update_document_processing_status, get_document_type_by_id,
-        get_banking_doc_category, insert_audit_record, update_analysis_record
+        get_banking_doc_category, insert_audit_record, update_analysis_record,
+        link_document_to_client
     )
     from common.s3_utils import get_file_metadata, copy_s3_object, delete_s3_object
     from common.validation import validate_document, determine_document_type, get_document_expiry_info
@@ -82,6 +83,20 @@ def check_s3_object_exists(bucket, key):
         else:
             logger.error(f"Error al verificar objeto: {str(e)}")
             raise
+
+# Opción 1: Función para obtener sourceIp de forma segura
+def obtener_ip_origen(context):
+    try:
+        # Verificar si identity está disponible y tiene el atributo sourceIp
+        if hasattr(context, 'identity') and hasattr(context.identity, 'sourceIp'):
+            return context.identity.sourceIp
+        # Verificar si clientContext está disponible
+        elif hasattr(context, 'client_context') and context.client_context:
+            if hasattr(context.client_context, 'client') and hasattr(context.client_context.client, 'sourceIp'):
+                return context.client_context.client.sourceIp
+        return '0.0.0.0'  # Valor predeterminado
+    except Exception:
+        return '0.0.0.0'  # Valor predeterminado en caso de error 
 
 def should_use_textract(metadata, doc_type_info, preliminary_classification):
     """
@@ -332,6 +347,26 @@ def process_document_metadata(document_id, metadata, bucket, key):
         requiere_validacion = cat_info.get('requiere_validacion', True) if cat_info else True
         validez_dias = cat_info.get('validez_en_dias') if cat_info else None
         
+
+        # Obtener ID del cliente desde metadatos de S3 si existe
+       
+        client_id = None
+        try:
+            s3_response = s3_client.head_object(Bucket=bucket, Key=key)
+            client_id = s3_response.get('Metadata', {}).get('client-id')
+        except Exception as e:
+            logger.warning(f"No se pudieron obtener metadatos adicionales: {str(e)}")
+        
+        logger.info(f"Vincular documento al cliente")
+        # Si tenemos ID de cliente, vincular el documento
+        if client_id:
+            try:
+                link_result = link_document_to_client(document_id, client_id)
+                logger.info(f"Documento {document_id} vinculado a cliente {client_id}: {link_result}")
+            except Exception as link_error:
+                logger.error(f"Error al vincular documento con cliente: {str(link_error)}")
+    
+ 
         # Preparar datos para inserción en base de datos
         document_data = {
             'id_documento': document_id,
@@ -495,7 +530,7 @@ def lambda_handler(event, context):
                             audit_data = {
                                 'fecha_hora': datetime.now().isoformat(),
                                 'usuario_id': 'admin-uuid-0001',
-                                'direccion_ip': getattr(context, 'identity', {}).get('sourceIp', '0.0.0.0'),
+                                'direccion_ip': obtener_ip_origen(context),
                                 'accion': 'rechazar',
                                 'entidad_afectada': 'documento',
                                 'id_entidad_afectada': document_id,
@@ -569,7 +604,7 @@ def lambda_handler(event, context):
                     audit_data = {
                         'fecha_hora': datetime.now().isoformat(),
                         'usuario_id': 'admin-uuid-0001',
-                        'direccion_ip': getattr(context, 'identity', {}).get('sourceIp', '0.0.0.0'),
+                        'direccion_ip': obtener_ip_origen(context),
                         'accion': 'crear',
                         'entidad_afectada': 'documento',
                         'id_entidad_afectada': document_id,

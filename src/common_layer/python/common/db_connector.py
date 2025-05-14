@@ -737,6 +737,49 @@ def generate_uuid():
     """Genera un UUID único"""
     return str(uuid.uuid4())
 
+def assign_folder_and_link(client_id, documento_id):
+    """
+    Asigna un documento a la carpeta adecuada del cliente según su categoría
+    """
+    try:
+        logger.info(f"Iniciando llamada a procedimiento almacenado para documento {documento_id} y cliente {client_id}")
+        
+        # Verificar que client_id y documento_id tienen valores válidos
+        if not client_id or not documento_id:
+            logger.error(f"Error en asignación: client_id={client_id}, documento_id={documento_id}")
+            return None
+            
+        # Llamar al procedimiento almacenado con más información de logging
+        query = "CALL registrar_documento_carpeta(%s, %s)"
+        logger.info(f"Ejecutando query: {query} con parámetros: ({client_id}, {documento_id})")
+        
+        # Obtener una conexión directa para mejor diagnóstico
+        connection = get_connection()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(query, (client_id, documento_id))
+                result = cursor.fetchall()
+                logger.info(f"Procedimiento ejecutado. Resultado: {result}")
+                
+                # Log de la tabla de log para verificar si se insertó
+                cursor.execute("SELECT COUNT(*) as count FROM log_procedimientos WHERE operacion = 'registrar_documento_carpeta' AND fecha > DATE_SUB(NOW(), INTERVAL 1 MINUTE)")
+                log_count = cursor.fetchone()
+                logger.info(f"Entradas recientes en log_procedimientos: {log_count['count'] if log_count else 'No se pudo verificar'}")
+                
+                if result and len(result) > 0:
+                    logger.info(f"Documento {documento_id} asignado a carpeta {result[0]['id_carpeta']} del cliente {client_id}")
+                    return result[0]
+                else:
+                    logger.warning(f"No se recibió información de carpeta para el documento {documento_id}")
+                    return None
+        finally:
+            connection.close()
+            
+    except Exception as e:
+        logger.error(f"Error al registrar documento en carpeta: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None
 # Nuevas funciones para DocumentExpiryMonitor 
 def get_expiring_documents(target_date):
     """
@@ -947,6 +990,30 @@ def get_client_by_id(client_id):
     finally:
         conn.close()
 
+def get_client_id_by_document(document_id):
+    """
+    Obtiene el ID del cliente asociado a un documento desde la tabla documentos_clientes.
+    
+    Args:
+        document_id (str): ID del documento
+    
+    Returns:
+        str or None: ID del cliente si existe, None si no está vinculado
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor() as cursor:
+            query = """
+                SELECT id_cliente
+                FROM documentos_clientes
+                WHERE id_documento = %s
+                LIMIT 1
+            """
+            cursor.execute(query, (document_id,))
+            result = cursor.fetchone()
+            return result['id_cliente'] if result else None
+    finally:
+        conn.close()
 # Añadir estas funciones al archivo db_connector.py
 
 def generate_process_log_id():

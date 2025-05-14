@@ -26,9 +26,12 @@ from common.db_connector import (
     log_document_processing_start,
     log_document_processing_end,
     get_document_processing_history,
-    update_document_extraction_data_with_type_preservation
+    update_document_extraction_data_with_type_preservation,
+    assign_folder_and_link,
+    get_client_id_by_document
 )
 
+ 
 # Configurar el logger
 logger = logging.getLogger()
 logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
@@ -718,6 +721,7 @@ def lambda_handler(event, context):
             entidades = document_data_result['extracted_data'].get('entidades')
             metadatos = document_data_result['extracted_data'].get('metadatos_extraccion')
             
+   
             # Registrar que comenzamos extracción de datos específicos
             sub_registro_id = log_document_processing_start(
                 document_id, 
@@ -741,6 +745,8 @@ def lambda_handler(event, context):
             # Paso 3: Validar datos extraídos common
             confidence = validation['confidence']
             tipo_detectado = id_data.get('tipo_identificacion')
+
+   
 
             requires_review = evaluate_confidence(
                 confidence,
@@ -974,6 +980,11 @@ def lambda_handler(event, context):
     # Calcular tiempo total de procesamiento
     total_time = time.time() - start_time
     
+    # Asignar carpeta y marcar documento solicitado como recibido
+    cliente_id = get_client_id_by_document(document_id)
+    logger.info(f"Procesando documento financiero Asignar cliente_id {cliente_id} para {document_id}")
+    assign_folder_and_link(cliente_id,document_id)
+  
     # Añadir resumen de procesamiento
     response['tiempo_total'] = total_time
     response['total_registros'] = len(event['Records'])
