@@ -7,6 +7,7 @@ import time
 import uuid
 import re
 from datetime import datetime
+import boto3
 
 # Configuración del logger
 logger = logging.getLogger()
@@ -98,6 +99,10 @@ def insert_document(document_data):
 
 def insert_document_version(version_data):
     """Inserta un nuevo registro de versión de documento"""
+    # Asegurarnos de que inicialmente no hay miniaturas generadas
+    if 'miniaturas_generadas' not in version_data:
+        version_data['miniaturas_generadas'] = False
+    
     query = """
     INSERT INTO versiones_documento (
         id_version,
@@ -112,7 +117,8 @@ def insert_document_version(version_data):
         nombre_original,
         extension,
         mime_type,
-        estado_ocr
+        estado_ocr,
+        miniaturas_generadas
     ) VALUES (
         %(id_version)s,
         %(id_documento)s,
@@ -126,10 +132,50 @@ def insert_document_version(version_data):
         %(nombre_original)s,
         %(extension)s,
         %(mime_type)s,
-        %(estado_ocr)s
+        %(estado_ocr)s,
+        %(miniaturas_generadas)s
     )
     """
-    return execute_query(query, version_data, fetch=False)
+    
+    # Insertar la versión del documento
+    version_id = execute_query(query, version_data, fetch=False)
+    
+    # Si el documento es un PDF, imagen u otro formato compatible con miniaturas
+    if version_data.get('extension', '').lower() in ['pdf', 'jpg', 'jpeg', 'png', 'tiff']:
+        try:
+            # Programar la generación de miniaturas enviando un mensaje a SQS
+            # para que un servicio lambda de miniaturas procese este documento
+            sqs_client = boto3.client('sqs')
+            
+            # Obtener URL de cola de SQS desde variables de entorno
+            THUMBNAILS_QUEUE_URL = os.environ.get('THUMBNAILS_QUEUE_URL')
+            
+            # Si no está configurada la cola, no hacer nada
+            if not THUMBNAILS_QUEUE_URL:
+                logger.warning(f"No se puede programar generación de miniaturas: THUMBNAILS_QUEUE_URL no configurada")
+                return version_id
+            
+            # Crear mensaje para generar miniaturas
+            message = {
+                'document_id': version_data['id_documento'],
+                'version_id': version_data['id_version'],
+                'bucket': version_data['ubicacion_almacenamiento_ruta'].split('/')[0] if '/' in version_data['ubicacion_almacenamiento_ruta'] else '',
+                'key': '/'.join(version_data['ubicacion_almacenamiento_ruta'].split('/')[1:]) if '/' in version_data['ubicacion_almacenamiento_ruta'] else version_data['ubicacion_almacenamiento_ruta'],
+                'extension': version_data['extension'],
+                'mime_type': version_data['mime_type']
+            }
+            
+            # Enviar mensaje a SQS
+            sqs_client.send_message(
+                QueueUrl=THUMBNAILS_QUEUE_URL,
+                MessageBody=json.dumps(message)
+            )
+            
+            logger.info(f"Generación de miniaturas programada para documento {version_data['id_documento']} versión {version_data['id_version']}")
+        except Exception as e:
+            logger.error(f"Error al programar generación de miniaturas: {str(e)}")
+    
+    return version_id
 
 def insert_analysis_record(analysis_data):
     """Inserta un nuevo registro de análisis IA para un documento"""

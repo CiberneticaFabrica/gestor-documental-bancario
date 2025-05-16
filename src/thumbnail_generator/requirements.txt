@@ -1,0 +1,4 @@
+PyMuPDF==1.21.1  # Para procesar PDFs (también conocido como fitz)
+Pillow==9.5.0    # Para procesamiento de imágenes
+boto3==1.26.0    # SDK de AWS
+pymysql==1.0.2   # Para conexiones a la base de datos MySQL
