@@ -15,6 +15,7 @@ Globals:
         DB_NAME: !Ref DBName
         DB_USER: !Ref DBUser
         DB_PASSWORD: !Ref DBPassword
+        THUMBNAILS_QUEUE_URL: !Ref ThumbnailsQueue
 
 Parameters:
   DBHost:
@@ -60,7 +61,6 @@ Resources:
       CompatibleRuntimes:
         - python3.9
       RetentionPolicy: Retain
-
   # Lambda Functions - Creamos las funciones primero
   DocumentUploadProcessorFunction:
     Type: AWS::Serverless::Function
@@ -94,6 +94,8 @@ Resources:
                 - !Sub "arn:aws:s3:::${AWS::StackName}-documents-processed/*"
         - SQSSendMessagePolicy:
             QueueName: !GetAtt DocumentClassificationQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ThumbnailsQueue.QueueName
         - Statement:
             - Effect: Allow
               Action:
@@ -113,7 +115,8 @@ Resources:
           PROCESSED_BUCKET: !Sub "${AWS::StackName}-documents-processed"
           TEXTRACT_SNS_TOPIC: !Ref TextractCompletionTopic
           TEXTRACT_ROLE_ARN: !GetAtt TextractSNSRole.Arn
-
+          THUMBNAILS_QUEUE_URL: !Ref ThumbnailsQueue
+ 
   # Permiso para permitir que S3 invoque la función Lambda
   DocumentUploadProcessorPermission:
     Type: AWS::Lambda::Permission
@@ -214,6 +217,55 @@ Resources:
     Properties:
       QueueName: !Sub ${AWS::StackName}-financial-dlq
       MessageRetentionPeriod: 1209600 # 14 days
+  # SQS Queue para generación de miniaturas
+  ThumbnailsQueue:
+   Type: AWS::SQS::Queue
+   Properties:
+    QueueName: !Sub ${AWS::StackName}-thumbnails-queue
+    VisibilityTimeout: 300
+    RedrivePolicy:
+      deadLetterTargetArn: !GetAtt ThumbnailsDLQ.Arn
+      maxReceiveCount: 3
+
+  ThumbnailsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-thumbnails-dlq
+      MessageRetentionPeriod: 1209600 # 14 días
+
+  # Función Lambda para el generador de miniaturas
+  ThumbnailGeneratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/thumbnail_generator/
+      Handler: app.lambda_handler
+      Description: Genera miniaturas para documentos procesados
+      Timeout: 60
+      MemorySize: 1024
+      Layers:
+        - !Ref CommonLayer
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ThumbnailsQueue.Arn
+            BatchSize: 1
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref DocumentsProcessedBucket
+        - S3CrudPolicy:
+            BucketName: !Ref DocumentsProcessedBucket
+        - VPCAccessPolicy: {}
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          THUMBNAILS_BUCKET: !Ref DocumentsProcessedBucket
+          THUMBNAILS_QUEUE_URL: !Ref ThumbnailsQueue
 
   # Tema SNS para notificaciones de Textract
   TextractCompletionTopic:
@@ -677,3 +729,7 @@ Outputs:
   ManualReviewHandlerApi:
     Description: "API Gateway URL for Manual Review Handler"
     Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+
+  ThumbnailsQueueURL:
+    Description: "URL for thumbnails processing queue"
+    Value: !Ref ThumbnailsQueue
