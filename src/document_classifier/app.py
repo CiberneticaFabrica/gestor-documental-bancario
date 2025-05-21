@@ -24,7 +24,9 @@ from classifier import classify_document, classify_by_filename, detect_cedula_fo
 from common.db_connector import (
     get_document_type_by_id, 
     update_document_processing_status,
-    execute_query
+    execute_query,
+    log_document_processing_start,
+    log_document_processing_end
 )
 
 # Configuración de reintentos para clientes AWS
@@ -178,12 +180,32 @@ def lambda_handler(event, context):
     start_time = time.time()
     logger.info(f"Evento recibido: {json.dumps(event)}")
     
+    # Registrar inicio del procesamiento global
+    lambda_registro_id = log_document_processing_start(
+        'document_classifier',  # No tenemos ID de documento aún
+        'clasificacion_documentos',
+        datos_entrada={"records_count": len(event.get('Records', []))}
+    )
+    
+    processed_count = 0
+    error_count = 0
+    
     for record in event['Records']:
         document_id = None
+        record_start_time = time.time()
+        
         try:
             # Parsear el mensaje SQS
             message_body = json.loads(record['body'])
             document_id = message_body['document_id']
+            
+            # Registrar inicio de procesamiento para este documento
+            registro_id = log_document_processing_start(
+                document_id,
+                'clasificacion_documento',
+                datos_entrada=message_body,
+                analisis_id=lambda_registro_id
+            )
             
             logger.info(f"Clasificando documento {document_id}")
             
@@ -194,11 +216,34 @@ def lambda_handler(event, context):
                 # Caso óptimo: los datos ya están extraídos, no invocamos Textract/Comprehend
                 logger.info(f"Extracción ya completada para documento {document_id}, usando datos existentes")
                 
+                # Registrar inicio de obtención de datos de análisis
+                db_registro_id = log_document_processing_start(
+                    document_id,
+                    'obtener_datos_analisis',
+                    datos_entrada={"extraction_complete": True},
+                    analisis_id=registro_id
+                )
+                
                 # Obtener datos de análisis de la base de datos
                 analysis_data = get_analysis_data(document_id)
                 
                 if analysis_data:
                     logger.info(f"Datos de análisis encontrados en base de datos para documento {document_id}")
+                    
+                    # Finalizar registro de obtención de datos de análisis
+                    log_document_processing_end(
+                        db_registro_id,
+                        estado='completado',
+                        datos_procesados={"tipo_documento": analysis_data.get('tipo_documento', 'desconocido')}
+                    )
+                    
+                    # Registrar inicio de procesamiento de texto y entidades
+                    text_registro_id = log_document_processing_start(
+                        document_id,
+                        'procesar_texto_entidades',
+                        datos_entrada={"texto_length": len(analysis_data.get('texto_extraido', '')) if analysis_data.get('texto_extraido') else 0},
+                        analisis_id=registro_id
+                    )
                     
                     # Extraer la información relevante
                     texto_extraido = analysis_data.get('texto_extraido', '')
@@ -214,8 +259,36 @@ def lambda_handler(event, context):
                         except json.JSONDecodeError:
                             logger.warning(f"Error al decodificar entidades_detectadas: {analysis_data['entidades_detectadas']}")
                     
+                    log_document_processing_end(
+                        text_registro_id,
+                        estado='completado',
+                        datos_procesados={"entidades_disponibles": entidades_detectadas is not None}
+                    )
+                    
+                    # Registrar inicio de verificación de patrones específicos
+                    patterns_registro_id = log_document_processing_start(
+                        document_id,
+                        'verificar_patrones_id',
+                        datos_entrada={"texto_length": len(texto_extraido)},
+                        analisis_id=registro_id
+                    )
+                    
                     # Verificar si hay patrones específicos de documentos de identidad
                     id_check_result = check_for_specific_id_patterns(texto_extraido, entidades_detectadas)
+                    
+                    log_document_processing_end(
+                        patterns_registro_id,
+                        estado='completado',
+                        datos_procesados={"is_id_document": id_check_result.get('is_id_document', False)}
+                    )
+                    
+                    # Registrar inicio de clasificación final
+                    classify_registro_id = log_document_processing_start(
+                        document_id,
+                        'clasificacion_final',
+                        datos_entrada={"id_check_result": id_check_result},
+                        analisis_id=registro_id
+                    )
                     
                     if id_check_result['is_id_document']:
                         # Si detectamos un documento de identidad con alta confianza, usamos esa clasificación
@@ -236,15 +309,40 @@ def lambda_handler(event, context):
                         # Si el tipo está vacío o es desconocido, intentar clasificar con el texto extraído
                         if tipo_documento in ('', 'desconocido') or confidence < 0.6:
                             logger.info(f"Reclasificando documento con texto extraído debido a baja confianza o tipo desconocido")
+                            
+                            # Registrar inicio de reclasificación
+                            reclass_registro_id = log_document_processing_start(
+                                document_id,
+                                'reclasificar_documento',
+                                datos_entrada={"motivo": "baja_confianza" if confidence < 0.6 else "tipo_desconocido"},
+                                analisis_id=classify_registro_id
+                            )
+                            
                             # Clasificar usando el texto extraído
                             new_classification = classify_document(texto_extraido, entidades_detectadas)
                             classification_results = new_classification
                             requires_verification = new_classification['confidence'] < 0.85
+                            
+                            log_document_processing_end(
+                                reclass_registro_id,
+                                estado='completado',
+                                datos_procesados={
+                                    "document_type": new_classification['document_type'],
+                                    "confidence": new_classification['confidence']
+                                }
+                            )
                         else:
                             # Determinar si requiere verificación manual
                             requires_verification = confidence < 0.85
                             
                             # Obtener información del tipo de documento
+                            doc_type_info_registro_id = log_document_processing_start(
+                                document_id,
+                                'obtener_info_tipo_documento',
+                                datos_entrada={"tipo_documento": tipo_documento},
+                                analisis_id=classify_registro_id
+                            )
+                            
                             doc_type_info = get_document_type_by_id(tipo_documento)
                             
                             # Si no se encuentra el tipo, usar una clasificación genérica
@@ -252,8 +350,21 @@ def lambda_handler(event, context):
                                 logger.warning(f"No se encontró información para el tipo {tipo_documento}, usando clasificación genérica")
                                 tipo_documento = 'contrato'
                                 doc_type_id = 'e5f6g7h8-5678-9012-abcd-ef1234567890123'  # ID genérico para contratos
+                                
+                                log_document_processing_end(
+                                    doc_type_info_registro_id,
+                                    estado='error',
+                                    mensaje_error=f"No se encontró información para el tipo {tipo_documento}",
+                                    datos_procesados={"tipo_generico": tipo_documento}
+                                )
                             else:
                                 doc_type_id = doc_type_info['id_tipo_documento']
+                                
+                                log_document_processing_end(
+                                    doc_type_info_registro_id,
+                                    estado='completado',
+                                    datos_procesados={"id_tipo_documento": doc_type_id}
+                                )
                                 
                             # Usar la clasificación de la base de datos
                             classification_results = {
@@ -261,9 +372,35 @@ def lambda_handler(event, context):
                                 'document_type_id': doc_type_id,
                                 'confidence': confidence
                             }
+                    
+                    log_document_processing_end(
+                        classify_registro_id,
+                        estado='completado',
+                        datos_procesados={
+                            "document_type": classification_results['document_type'],
+                            "confidence": classification_results['confidence'],
+                            "requires_verification": requires_verification
+                        }
+                    )
+                    
                 else:
                     # No se encontraron datos, debemos usar la información del mensaje
                     logger.warning(f"No se encontraron datos de análisis para documento {document_id}, usando datos del mensaje")
+                    
+                    log_document_processing_end(
+                        db_registro_id,
+                        estado='error',
+                        mensaje_error="No se encontraron datos de análisis",
+                        datos_procesados={"fallback": "usando_datos_mensaje"}
+                    )
+                    
+                    # Registrar inicio de clasificación por mensaje
+                    fallback_registro_id = log_document_processing_start(
+                        document_id,
+                        'clasificacion_por_mensaje',
+                        datos_entrada={"tiene_doc_type_info": 'doc_type_info' in message_body},
+                        analisis_id=registro_id
+                    )
                     
                     # Usar la información del message_body si está disponible
                     doc_type_info = message_body.get('doc_type_info', {})
@@ -273,16 +410,42 @@ def lambda_handler(event, context):
                         'confidence': doc_type_info.get('confidence', 0.7)
                     }
                     requires_verification = True
+                    
+                    log_document_processing_end(
+                        fallback_registro_id,
+                        estado='completado',
+                        datos_procesados={
+                            "document_type": classification_results['document_type'],
+                            "confidence": classification_results['confidence']
+                        }
+                    )
             else:
                 # Caso excepcional: debemos obtener los datos nosotros
                 # Esto es un fallback y no debería ocurrir normalmente en la arquitectura optimizada
                 logger.warning(f"Extracción no completada para documento {document_id}, usando clasificación por nombre")
+                
+                fallback_registro_id = log_document_processing_start(
+                    document_id,
+                    'clasificacion_por_filename',
+                    datos_entrada={"extraction_complete": False},
+                    analisis_id=registro_id
+                )
                 
                 # Intentar clasificar por nombre de archivo si está disponible
                 key = message_body.get('key', '')
                 if key:
                     filename = os.path.basename(unquote_plus(key))
                     classification_results = classify_by_filename(filename)
+                    
+                    log_document_processing_end(
+                        fallback_registro_id,
+                        estado='completado',
+                        datos_procesados={
+                            "filename": filename,
+                            "document_type": classification_results['document_type'],
+                            "confidence": classification_results['confidence']
+                        }
+                    )
                 else:
                     # Sin datos suficientes, usar clasificación genérica
                     classification_results = {
@@ -290,28 +453,80 @@ def lambda_handler(event, context):
                         'document_type_id': 'e5f6g7h8-5678-9012-abcd-ef1234567890123',
                         'confidence': 0.5
                     }
+                    
+                    log_document_processing_end(
+                        fallback_registro_id,
+                        estado='error',
+                        mensaje_error="Sin nombre de archivo disponible",
+                        datos_procesados={"clasificacion_generica": True}
+                    )
                 
                 requires_verification = True
             
             # Actualizar estado de procesamiento
+            update_status_registro_id = log_document_processing_start(
+                document_id,
+                'actualizar_estado_procesamiento',
+                datos_entrada={
+                    "document_type": classification_results['document_type'],
+                    "confidence": classification_results['confidence']
+                },
+                analisis_id=registro_id
+            )
+            
             update_document_processing_status(
                 document_id,
                 'clasificacion_completada',
                 f"Documento clasificado como {classification_results['document_type']} con confianza {classification_results['confidence']:.2f}"
             )
             
+            log_document_processing_end(
+                update_status_registro_id,
+                estado='completado'
+            )
+            
             # Determinar la siguiente cola de procesamiento
+            queue_registro_id = log_document_processing_start(
+                document_id,
+                'determinar_cola_procesamiento',
+                datos_entrada={"document_type": classification_results['document_type']},
+                analisis_id=registro_id
+            )
+            
             next_queue_url = determine_processor_queue(classification_results['document_type'])
             
             if not next_queue_url:
                 logger.warning(f"No se encontró cola para {classification_results['document_type']}, usando cola por defecto")
                 next_queue_url = DEFAULT_PROCESSOR_QUEUE_URL
+                
+                log_document_processing_end(
+                    queue_registro_id,
+                    estado='completado_con_advertencia',
+                    mensaje_error=f"Cola no encontrada para tipo {classification_results['document_type']}",
+                    datos_procesados={"queue_url": next_queue_url, "usando_default": True}
+                )
+            else:
+                log_document_processing_end(
+                    queue_registro_id,
+                    estado='completado',
+                    datos_procesados={"queue_url": next_queue_url}
+                )
             
             # Enviar para procesamiento especializado
             logger.info(f"Enviando documento a procesador especializado: {classification_results['document_type']}")
             
             # Registro de tiempo para análisis de rendimiento
-            processing_time = time.time() - start_time
+            processing_time = time.time() - record_start_time
+            
+            sqs_registro_id = log_document_processing_start(
+                document_id,
+                'enviar_a_cola_especializada',
+                datos_entrada={
+                    "queue_url": next_queue_url,
+                    "document_type": classification_results['document_type']
+                },
+                analisis_id=registro_id
+            )
             
             try:
                 # Preparar mensaje para el procesador específico
@@ -346,22 +561,121 @@ def lambda_handler(event, context):
                 logger.info(f"Documento {document_id} clasificado como {classification_results['document_type']} " +
                            f"(confianza: {classification_results['confidence']:.2f}) " +
                            f"en {processing_time:.2f} segundos")
+                
+                log_document_processing_end(
+                    sqs_registro_id,
+                    estado='completado',
+                    datos_procesados={"queue_url": next_queue_url}
+                )
+                
+                # Registrar finalización exitosa del procesamiento de este documento
+                log_document_processing_end(
+                    registro_id,
+                    estado='completado',
+                    confianza=classification_results['confidence'],
+                    datos_procesados={
+                        "document_type": classification_results['document_type'],
+                        "processing_time_seconds": processing_time
+                    }
+                )
+                
+                processed_count += 1
+                
             except Exception as sqs_error:
                 logger.error(f"Error al enviar a cola de procesamiento: {str(sqs_error)}")
+                
+                log_document_processing_end(
+                    sqs_registro_id,
+                    estado='error',
+                    mensaje_error=str(sqs_error)
+                )
+                
+                log_document_processing_end(
+                    registro_id,
+                    estado='error',
+                    mensaje_error=f"Error al enviar a cola: {str(sqs_error)}",
+                    datos_procesados={
+                        "document_type": classification_results['document_type'],
+                        "processing_time_seconds": processing_time
+                    }
+                )
+                
+                error_count += 1
             
         except json.JSONDecodeError as json_error:
             logger.error(f"Error al decodificar mensaje SQS: {str(json_error)}")
+            
+            if document_id:
+                error_registro_id = log_document_processing_start(
+                    document_id,
+                    'error_decodificar_json',
+                    datos_entrada={"mensaje": str(json_error)},
+                    analisis_id=lambda_registro_id
+                )
+                
+                log_document_processing_end(
+                    error_registro_id,
+                    estado='error',
+                    mensaje_error=str(json_error)
+                )
+                
+            error_count += 1
             continue
+            
         except KeyError as key_error:
             logger.error(f"Falta campo requerido en mensaje: {str(key_error)}")
+            
+            if document_id:
+                error_registro_id = log_document_processing_start(
+                    document_id,
+                    'error_campo_faltante',
+                    datos_entrada={"campo": str(key_error)},
+                    analisis_id=lambda_registro_id
+                )
+                
+                log_document_processing_end(
+                    error_registro_id,
+                    estado='error',
+                    mensaje_error=str(key_error)
+                )
+                
+            error_count += 1
             continue
+            
         except Exception as e:
             logger.error(f"Error general al procesar mensaje: {str(e)}")
             logger.error(traceback.format_exc())
+            
+            if document_id:
+                error_registro_id = log_document_processing_start(
+                    document_id,
+                    'error_general',
+                    datos_entrada={"tipo_error": type(e).__name__},
+                    analisis_id=lambda_registro_id
+                )
+                
+                log_document_processing_end(
+                    error_registro_id,
+                    estado='error',
+                    mensaje_error=str(e)
+                )
+                
+            error_count += 1
     
     # Tiempo total de procesamiento
     total_time = time.time() - start_time
     logger.info(f"Procesamiento completo en {total_time:.2f} segundos")
+    
+    # Registrar finalización del procesamiento global
+    log_document_processing_end(
+        lambda_registro_id,
+        estado='completado',
+        datos_procesados={
+            "procesados": processed_count,
+            "errores": error_count,
+            "tiempo_total_segundos": total_time
+        }
+    )
     
     return {
         'statusCode': 200,

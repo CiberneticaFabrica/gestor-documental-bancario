@@ -11,7 +11,7 @@ logger = logging.getLogger()
 SNS_TOPIC_ARN = os.environ.get('NOTIFICATION_TOPIC_ARN')
 EMAIL_TEMPLATE_BUCKET = os.environ.get('EMAIL_TEMPLATE_BUCKET')
 EMAIL_TEMPLATE_KEY_PREFIX = os.environ.get('EMAIL_TEMPLATE_KEY_PREFIX', 'templates/email/')
-SOURCE_EMAIL = os.environ.get('SOURCE_EMAIL', 'noreply@ejemplo.com')
+SOURCE_EMAIL = os.environ.get('SOURCE_EMAIL', 'notify@softwarefactory.cibernetica.xyz')
 
 # Inicializar clientes AWS
 sns_client = boto3.client('sns')
@@ -257,7 +257,7 @@ def generate_email_content(notification_data, notification_type):
         logger.warning(f"Error cargando plantilla de email: {str(e)}")
         
         client_name = notification_data['client']['name']
-        doc_type = notification_data['document']['title']
+        doc_type = notification_data['document']['type']
         expiry_date = notification_data['document']['expiry_date']
         days = notification_data['document']['days_to_expiry']
         

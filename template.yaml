@@ -543,7 +543,7 @@ Resources:
           NOTIFICATION_TOPIC_ARN: !Ref DocumentExpiryNotificationTopic
           EMAIL_TEMPLATE_BUCKET: !Ref DocumentsProcessedBucket
           EMAIL_TEMPLATE_KEY_PREFIX: templates/email/
-          SOURCE_EMAIL: epenalbadev@hotmail.com  # Dirección remitente verificada en SES
+          SOURCE_EMAIL: notify@softwarefactory.cibernetica.xyz # Dirección remitente verificada en SES
       Events:
         DailyCheck:
           Type: Schedule
