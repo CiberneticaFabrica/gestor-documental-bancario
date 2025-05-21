@@ -16,16 +16,13 @@ sys.path.append('/opt')
 
 from common.db_connector import (
     execute_query,
-    update_document_extraction_data,
+ 
     update_document_processing_status,
     get_document_by_id,
-    register_document_identification,
-    link_document_to_client,
-    insert_analysis_record,
-    generate_uuid,
+ 
     log_document_processing_start,
     log_document_processing_end,
-    get_document_processing_history,
+ 
     update_document_extraction_data_with_type_preservation,
     assign_folder_and_link,
     get_client_id_by_document

@@ -472,7 +472,7 @@ def link_document_to_client(document_id, client_id=None, document_type_id=None):
             id_cliente,
             fecha_asignacion,
             asignado_por
-        ) VALUES (%s, %s, NOW(), 'admin-uuid-0001')
+        ) VALUES (%s, %s, NOW(), '691d8c44-f524-48fd-b292-be9e31977711')
         """
         execute_query(query, (document_id, client_id), fetch=False)
         return True
@@ -639,8 +639,8 @@ def update_document_extraction_data(document_id, extracted_data, confidence, val
                     'id_tipo_documento': tipo_id,
                     'titulo': f"Documento {codigo_doc}",
                     'descripcion': "Documento creado automáticamente durante procesamiento",
-                    'creado_por': 'admin-uuid-0001',
-                    'modificado_por': 'admin-uuid-0001',
+                    'creado_por': '691d8c44-f524-48fd-b292-be9e31977711',
+                    'modificado_por': '691d8c44-f524-48fd-b292-be9e31977711',
                     'id_carpeta': '22222222-aaaa-bbbb-cccc-222222222222',
                     'estado': 'procesando',
                     'confianza_extraccion': confidence,
@@ -666,7 +666,7 @@ def update_document_extraction_data(document_id, extracted_data, confidence, val
                     'mensaje_error': None,
                     'version_modelo': 'textract-auto',
                     'tiempo_procesamiento': 0,
-                    'procesado_por': 'admin-uuid-0001',
+                    'procesado_por': '691d8c44-f524-48fd-b292-be9e31977711',
                     'requiere_verificacion': True,
                     'verificado': False,
                     'verificado_por': None,
