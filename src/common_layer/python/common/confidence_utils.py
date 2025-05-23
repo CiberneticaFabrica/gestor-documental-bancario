@@ -1,6 +1,7 @@
 # common/confidence_utils.py
 import os
 import logging
+import json
 from common.db_connector import update_analysis_record, log_document_processing_start, log_document_processing_end
 
 logger = logging.getLogger()

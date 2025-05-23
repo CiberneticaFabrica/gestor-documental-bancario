@@ -140,6 +140,26 @@ def insert_document_version(version_data):
     # Insertar la versión del documento
     version_id = execute_query(query, version_data, fetch=False)
     
+    # Verificar si es un documento migrado (viene de otro sistema con header especial)
+    try:
+        if 'metadatos' in version_data and version_data['metadatos']:
+            metadatos = version_data['metadatos']
+            if isinstance(metadatos, str):
+                metadatos = json.loads(metadatos)
+
+            external_id = metadatos.get('x-amz-meta-external-file-id')
+            client_id = metadatos.get('id_cliente') or metadatos.get('client_id')
+
+            if external_id and client_id:
+                insert_migrated_document_info(
+                    creatio_file_id=external_id,
+                    id_documento=version_data['id_documento'],
+                    id_cliente=client_id,
+                    nombre_archivo=version_data.get('nombre_original', '')
+                )
+    except Exception as e:
+        logger.warning(f"No se pudo procesar metadata de migración: {str(e)}")
+
     # Si el documento es un PDF, imagen u otro formato compatible con miniaturas
     if version_data.get('extension', '').lower() in ['pdf', 'jpg', 'jpeg', 'png', 'tiff']:
         try:
@@ -183,6 +203,7 @@ def insert_analysis_record(analysis_data):
     INSERT INTO analisis_documento_ia (
         id_analisis,
         id_documento,
+        id_version,
         tipo_documento,
         confianza_clasificacion,
         texto_extraido,
@@ -202,6 +223,7 @@ def insert_analysis_record(analysis_data):
         %(id_analisis)s,
         %(id_documento)s,
         %(tipo_documento)s,
+        %(id_version)s,
         %(confianza_clasificacion)s,
         %(texto_extraido)s,
         %(entidades_detectadas)s,
@@ -221,7 +243,7 @@ def insert_analysis_record(analysis_data):
     return execute_query(query, analysis_data, fetch=False)
 
 def update_analysis_record(
-    id_analisis,
+    id_analisis,  # ✅ Este debe ser el analysis_id, no document_id
     texto_extraido,
     entidades_detectadas,
     metadatos_extraccion,
@@ -235,44 +257,82 @@ def update_analysis_record(
     confianza_clasificacion=0.0,
     verificado_por=None,
     fecha_verificacion=None,
-    tipo_documento="contrato"
+    tipo_documento="contrato",
+    id_version=None  # ✅ AGREGAR: Parámetro para version_id
 ):
-    """Registra o actualiza el análisis IA de un documento"""
-    # Mapear tipos de documento a nombres reconocidos
-    tipo_documento_map = {
-        'dni': 'DNI',
-        'cedula_panama': 'DNI',
-        'pasaporte': 'Pasaporte',
-        'contrato': 'Contrato',
-        'desconocido': 'Documento'
-    }
-    
-    # Usar el tipo mapeado si existe, si no, usar el tipo original
-    tipo_doc_normalizado = tipo_documento_map.get(tipo_documento.lower(), tipo_documento)
-    
-    data = {
-        'id_analisis': id_analisis,
-        'id_documento': id_analisis,
-        'tipo_documento': tipo_doc_normalizado,
-        'confianza_clasificacion': confianza_clasificacion,
-        'texto_extraido': texto_extraido,
-        'entidades_detectadas': entidades_detectadas,
-        'metadatos_extraccion': metadatos_extraccion,
-        'fecha_analisis': datetime.utcnow(),
-        'estado_analisis': estado_analisis,
-        'mensaje_error': mensaje_error,
-        'version_modelo': version_modelo,
-        'tiempo_procesamiento': tiempo_procesamiento,
-        'procesado_por': procesado_por,
-        'requiere_verificacion': requiere_verificacion,
-        'verificado': verificado,
-        'verificado_por': verificado_por,
-        'fecha_verificacion': fecha_verificacion
-    }
+    """
+    Actualiza un registro de análisis existente.
+    VERSIÓN CORREGIDA que actualiza en lugar de insertar.
+    """
     try:
-        insert_analysis_record(data)
+        # Mapear tipos de documento a nombres reconocidos
+        tipo_documento_map = {
+            'dni': 'DNI',
+            'cedula_panama': 'DNI',
+            'pasaporte': 'Pasaporte',
+            'contrato': 'Contrato',
+            'desconocido': 'Documento'
+        }
+        
+        # Usar el tipo mapeado si existe, si no, usar el tipo original
+        tipo_doc_normalizado = tipo_documento_map.get(tipo_documento.lower(), tipo_documento)
+        
+        # CORRECCIÓN: Actualizar en lugar de insertar
+        query = """
+        UPDATE analisis_documento_ia 
+        SET texto_extraido = %s,
+            entidades_detectadas = %s,
+            metadatos_extraccion = %s,
+            estado_analisis = %s,
+            version_modelo = %s,
+            tiempo_procesamiento = %s,
+            procesado_por = %s,
+            requiere_verificacion = %s,
+            verificado = %s,
+            mensaje_error = %s,
+            confianza_clasificacion = %s,
+            verificado_por = %s,
+            fecha_verificacion = %s,
+            tipo_documento = %s,
+            fecha_analisis = NOW()
+        """
+        
+        params = [
+            texto_extraido, entidades_detectadas, metadatos_extraccion,
+            estado_analisis, version_modelo, tiempo_procesamiento,
+            procesado_por, requiere_verificacion, verificado,
+            mensaje_error, confianza_clasificacion, verificado_por,
+            fecha_verificacion, tipo_doc_normalizado
+        ]
+        
+        # ✅ Agregar id_version si se proporciona
+        if id_version:
+            query += ", id_version = %s"
+            params.append(id_version)
+        
+        query += " WHERE id_analisis = %s"
+        params.append(id_analisis)
+        
+        # Ejecutar la actualización
+        execute_query(query, params, fetch=False)
+        
+        # Verificar si se actualizó algún registro
+        verify_query = """
+        SELECT COUNT(*) as count FROM analisis_documento_ia 
+        WHERE id_analisis = %s
+        """
+        verify_result = execute_query(verify_query, (id_analisis,))
+        
+        if not verify_result or verify_result[0]['count'] == 0:
+            logger.warning(f"No se encontró registro de análisis {id_analisis} para actualizar")
+            return False
+        
+        logger.info(f"Registro de análisis {id_analisis} actualizado correctamente")
+        return True
+        
     except Exception as e:
-        logger.error(f"Error al registrar análisis IA: {str(e)}")
+        logger.error(f"Error al actualizar análisis {id_analisis}: {str(e)}")
+        return False
 
 def get_document_type_by_name(type_name):
     """Busca un tipo de documento por nombre"""
@@ -1958,3 +2018,886 @@ def calculate_document_risk(completitud, docs_caducados, nivel_riesgo_cliente):
             riesgo_base = 'medio'
     
     return riesgo_base
+
+# Añadir estas funciones a db_connector.py
+def preserve_document_data_before_update(document_id, reason="Manual preservation"):
+    """
+    Preserva los datos actuales de un documento antes de actualizarlo
+    """
+    try:
+        # Obtener datos actuales del documento
+        document = get_document_by_id(document_id)
+        if not document:
+            logger.error(f"Documento {document_id} no encontrado")
+            return False
+        
+        # Obtener la versión actual
+        version_query = """
+        SELECT id_version FROM versiones_documento 
+        WHERE id_documento = %s AND numero_version = %s
+        LIMIT 1
+        """
+        version_result = execute_query(version_query, (document_id, document['version_actual']))
+        
+        if not version_result:
+            logger.error(f"No se encontró la versión actual para documento {document_id}")
+            return False
+        
+        current_version_id = version_result[0]['id_version']
+        
+        # Si hay datos extraídos, preservarlos
+        if document.get('datos_extraidos_ia'):
+            historico_id = generate_uuid()
+            
+            insert_query = """
+            INSERT INTO historico_datos_extraidos (
+                id_historico,
+                id_documento,
+                id_version,
+                datos_extraidos_ia,
+                confianza_extraccion,
+                validado_manualmente,
+                preservado_por,
+                motivo_preservacion
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            
+            execute_query(insert_query, (
+                historico_id,
+                document_id,
+                current_version_id,
+                document['datos_extraidos_ia'],
+                document.get('confianza_extraccion', 0),
+                document.get('validado_manualmente', False),
+                document.get('modificado_por'),
+                reason
+            ), fetch=False)
+            
+            logger.info(f"Datos preservados para documento {document_id}, versión {document['version_actual']}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error al preservar datos del documento: {str(e)}")
+        return False
+
+def get_document_version_history(document_id, include_data=False):
+    """
+    Obtiene el historial completo de versiones de un documento
+    """
+    try:
+        if include_data:
+            # Usar la vista que incluye los datos extraídos
+            query = """
+            SELECT * FROM vista_historial_documento
+            WHERE id_documento = %s
+            ORDER BY numero_version DESC
+            """
+        else:
+            # Solo información básica de versiones
+            query = """
+            SELECT 
+                v.id_version,
+                v.numero_version,
+                v.fecha_creacion,
+                v.creado_por,
+                v.comentario_version,
+                v.nombre_original,
+                v.tamano_bytes,
+                v.estado_ocr,
+                u.nombre_usuario as creado_por_nombre,
+                CASE 
+                    WHEN v.numero_version = d.version_actual THEN TRUE
+                    ELSE FALSE
+                END as es_version_actual
+            FROM versiones_documento v
+            JOIN documentos d ON v.id_documento = d.id_documento
+            LEFT JOIN usuarios u ON v.creado_por = u.id_usuario
+            WHERE v.id_documento = %s
+            ORDER BY v.numero_version DESC
+            """
+        
+        return execute_query(query, (document_id,))
+        
+    except Exception as e:
+        logger.error(f"Error al obtener historial de versiones: {str(e)}")
+        return []
+
+def restore_document_version(document_id, version_number, restored_by):
+    """
+    Restaura una versión anterior de un documento
+    """
+    connection = get_connection()
+    try:
+        connection.begin()
+        
+        with connection.cursor() as cursor:
+            # 1. Verificar que la versión existe
+            check_query = """
+            SELECT v.*, h.datos_extraidos_ia, h.confianza_extraccion, h.validado_manualmente
+            FROM versiones_documento v
+            LEFT JOIN historico_datos_extraidos h ON v.id_version = h.id_version
+            WHERE v.id_documento = %s AND v.numero_version = %s
+            """
+            cursor.execute(check_query, (document_id, version_number))
+            version_data = cursor.fetchone()
+            
+            if not version_data:
+                raise ValueError(f"No se encontró la versión {version_number} del documento {document_id}")
+            
+            # 2. Preservar datos actuales antes de restaurar
+            preserve_document_data_before_update(document_id, f"Restauración a versión {version_number}")
+            
+            # 3. Actualizar el documento con los datos de la versión restaurada
+            update_query = """
+            UPDATE documentos
+            SET version_actual = %s,
+                modificado_por = %s,
+                fecha_modificacion = NOW()
+            """
+            
+            params = [version_number, restored_by]
+            
+            # Si hay datos extraídos históricos, restaurarlos también
+            if version_data.get('datos_extraidos_ia'):
+                update_query += """,
+                    datos_extraidos_ia = %s,
+                    confianza_extraccion = %s,
+                    validado_manualmente = %s
+                """
+                params.extend([
+                    version_data['datos_extraidos_ia'],
+                    version_data.get('confianza_extraccion', 0),
+                    version_data.get('validado_manualmente', False)
+                ])
+            
+            update_query += " WHERE id_documento = %s"
+            params.append(document_id)
+            
+            cursor.execute(update_query, params)
+            
+            # 4. Registrar en auditoría
+            audit_data = {
+                'fecha_hora': datetime.now().isoformat(),
+                'usuario_id': restored_by,
+                'direccion_ip': '0.0.0.0',
+                'accion': 'restaurar_version',
+                'entidad_afectada': 'documento',
+                'id_entidad_afectada': document_id,
+                'detalles': json.dumps({
+                    'version_restaurada': version_number,
+                    'version_id': version_data['id_version']
+                }),
+                'resultado': 'éxito'
+            }
+            insert_audit_record(audit_data)
+            
+            connection.commit()
+            logger.info(f"Documento {document_id} restaurado a versión {version_number}")
+            return True
+            
+    except Exception as e:
+        connection.rollback()
+        logger.error(f"Error al restaurar versión: {str(e)}")
+        raise
+    finally:
+        connection.close()
+
+def compare_document_versions(document_id, version1, version2):
+    """
+    Compara dos versiones de un documento
+    """
+    try:
+        query = """
+        SELECT 
+            v.numero_version,
+            v.fecha_creacion,
+            v.nombre_original,
+            v.tamano_bytes,
+            COALESCE(h.datos_extraidos_ia, d.datos_extraidos_ia) as datos_extraidos,
+            COALESCE(h.confianza_extraccion, d.confianza_extraccion) as confianza
+        FROM versiones_documento v
+        LEFT JOIN historico_datos_extraidos h ON v.id_version = h.id_version
+        LEFT JOIN documentos d ON (v.id_documento = d.id_documento AND v.numero_version = d.version_actual)
+        WHERE v.id_documento = %s AND v.numero_version IN (%s, %s)
+        """
+        
+        results = execute_query(query, (document_id, version1, version2))
+        
+        if len(results) != 2:
+            raise ValueError("No se encontraron ambas versiones para comparar")
+        
+        # Organizar resultados por versión
+        comparison = {}
+        for result in results:
+            version_num = result['numero_version']
+            comparison[f'version_{version_num}'] = {
+                'fecha': result['fecha_creacion'],
+                'archivo': result['nombre_original'],
+                'tamaño': result['tamano_bytes'],
+                'confianza': result['confianza']
+            }
+            
+            # Comparar datos extraídos si existen
+            if result['datos_extraidos']:
+                try:
+                    datos = json.loads(result['datos_extraidos']) if isinstance(result['datos_extraidos'], str) else result['datos_extraidos']
+                    comparison[f'version_{version_num}']['datos_extraidos'] = datos
+                except:
+                    pass
+        
+        # Calcular diferencias
+        differences = {
+            'archivo_cambio': comparison[f'version_{version1}']['archivo'] != comparison[f'version_{version2}']['archivo'],
+            'tamaño_diferencia': comparison[f'version_{version2}']['tamaño'] - comparison[f'version_{version1}']['tamaño'],
+            'confianza_cambio': comparison[f'version_{version2}']['confianza'] - comparison[f'version_{version1}']['confianza']
+        }
+        
+        comparison['diferencias'] = differences
+        
+        return comparison
+        
+    except Exception as e:
+        logger.error(f"Error al comparar versiones: {str(e)}")
+        raise
+
+def get_latest_extraction_data(document_id, version_id=None):
+    """
+    Obtiene los datos de extracción más recientes, ya sea de la versión actual
+    o de una versión específica
+    """
+    try:
+        if version_id:
+            # Buscar en histórico primero
+            query = """
+            SELECT datos_extraidos_ia, confianza_extraccion, validado_manualmente
+            FROM historico_datos_extraidos
+            WHERE id_documento = %s AND id_version = %s
+            ORDER BY fecha_extraccion DESC
+            LIMIT 1
+            """
+            result = execute_query(query, (document_id, version_id))
+            
+            if result:
+                return result[0]
+        
+        # Si no hay versión específica o no se encontró en histórico,
+        # buscar en documento actual
+        query = """
+        SELECT datos_extraidos_ia, confianza_extraccion, validado_manualmente
+        FROM documentos
+        WHERE id_documento = %s
+        """
+        result = execute_query(query, (document_id,))
+        
+        return result[0] if result else None
+        
+    except Exception as e:
+        logger.error(f"Error al obtener datos de extracción: {str(e)}")
+        return None  
+
+def insert_migrated_document_info(creatio_file_id, id_documento, id_cliente, nombre_archivo):
+    """
+    Inserta un registro en la tabla documentos_migrados_creatio si el documento proviene de una migración externa.
+    """
+    try:
+        query = """
+        INSERT INTO documentos_migrados_creatio (
+            id,
+            creatio_file_id,
+            id_documento,
+            id_cliente,
+            fecha_migracion,
+            nombre_archivo
+        ) VALUES (%s, %s, %s, %s, NOW(), %s)
+        """
+        params = (
+            str(uuid.uuid4()),  # id
+            creatio_file_id,    # x-amz-meta-external-file-id
+            id_documento,
+            id_cliente,
+            nombre_archivo
+        )
+        execute_query(query, params, fetch=False)
+        logger.info(f"📥 Registro de documento migrado insertado correctamente para archivo {nombre_archivo}")
+    except Exception as e:
+        logger.error(f"❌ Error al insertar documento migrado: {str(e)}")
+
+def preserve_identification_data(document_id, version_id=None, reason="Manual preservation"):
+    """
+    Preserva los datos de identificación actuales antes de una actualización
+    """
+    try:
+        # Obtener datos actuales de identificación
+        query = """
+        SELECT * FROM documentos_identificacion
+        WHERE id_documento = %s
+        """
+        
+        id_data = execute_query(query, (document_id,))
+        
+        if not id_data:
+            logger.warning(f"No se encontraron datos de identificación para documento {document_id}")
+            return False
+        
+        current_data = id_data[0]
+        
+        # Si no se proporciona version_id, obtener la versión actual
+        if not version_id:
+            version_query = """
+            SELECT v.id_version 
+            FROM versiones_documento v
+            JOIN documentos d ON v.id_documento = d.id_documento
+            WHERE v.id_documento = %s AND v.numero_version = d.version_actual
+            LIMIT 1
+            """
+            version_result = execute_query(version_query, (document_id,))
+            version_id = version_result[0]['id_version'] if version_result else generate_uuid()
+        
+        # Generar ID para el histórico
+        historico_id = generate_uuid()
+        
+        # Insertar en histórico
+        insert_query = """
+        INSERT INTO historico_documentos_identificacion (
+            id_historico, id_documento, id_version,
+            tipo_documento, numero_documento, pais_emision,
+            fecha_emision, fecha_expiracion, nombre_completo,
+            genero, lugar_nacimiento, autoridad_emision,
+            nacionalidad, codigo_pais,
+            preservado_por, motivo_preservacion
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+        )
+        """
+        
+        execute_query(insert_query, (
+            historico_id,
+            document_id,
+            version_id,
+            current_data.get('tipo_documento'),
+            current_data.get('numero_documento'),
+            current_data.get('pais_emision'),
+            current_data.get('fecha_emision'),
+            current_data.get('fecha_expiracion'),
+            current_data.get('nombre_completo'),
+            current_data.get('genero'),
+            current_data.get('lugar_nacimiento'),
+            current_data.get('autoridad_emision'),
+            current_data.get('nacionalidad'),
+            current_data.get('codigo_pais'),
+            '691d8c44-f524-48fd-b292-be9e31977711', # Usuario sistema
+            reason
+        ), fetch=False)
+        
+        logger.info(f"Datos de identificación preservados para documento {document_id}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error al preservar datos de identificación: {str(e)}")
+        return False
+
+def get_identification_history(document_id):
+    """
+    Obtiene el historial completo de datos de identificación de un documento
+    """
+    try:
+        query = """
+        SELECT 
+            h.*,
+            v.numero_version,
+            v.fecha_creacion as fecha_version,
+            v.comentario_version,
+            CASE 
+                WHEN v.numero_version = (SELECT version_actual FROM documentos WHERE id_documento = %s)
+                THEN 'Actual' 
+                ELSE 'Histórica'
+            END as estado_version
+        FROM historico_documentos_identificacion h
+        JOIN versiones_documento v ON h.id_version = v.id_version
+        WHERE h.id_documento = %s
+        ORDER BY v.numero_version DESC, h.fecha_preservacion DESC
+        """
+        
+        history = execute_query(query, (document_id, document_id))
+        
+        # Obtener también los datos actuales
+        current_query = """
+        SELECT 
+            di.*,
+            d.version_actual as numero_version,
+            'Actual' as estado_version,
+            NOW() as fecha_preservacion
+        FROM documentos_identificacion di
+        JOIN documentos d ON di.id_documento = d.id_documento
+        WHERE di.id_documento = %s
+        """
+        
+        current = execute_query(current_query, (document_id,))
+        
+        # Combinar histórico con datos actuales
+        all_data = []
+        if current:
+            all_data.extend(current)
+        if history:
+            all_data.extend(history)
+            
+        return all_data
+        
+    except Exception as e:
+        logger.error(f"Error al obtener historial de identificación: {str(e)}")
+        return []
+
+def compare_identification_versions(document_id, version1, version2):
+    """
+    Compara dos versiones de datos de identificación
+    """
+    try:
+        # Obtener datos de la versión 1
+        query_v1 = """
+        SELECT * FROM vista_historial_identificacion
+        WHERE id_documento = %s AND numero_version = %s
+        """
+        data_v1 = execute_query(query_v1, (document_id, version1))
+        
+        # Obtener datos de la versión 2
+        data_v2 = execute_query(query_v1, (document_id, version2))
+        
+        if not data_v1 or not data_v2:
+            raise ValueError("No se encontraron datos para una o ambas versiones")
+        
+        v1 = data_v1[0]
+        v2 = data_v2[0]
+        
+        # Comparar campos y detectar cambios
+        comparison = {
+            'version_1': version1,
+            'version_2': version2,
+            'cambios': {},
+            'resumen': []
+        }
+        
+        # Campos a comparar
+        campos = [
+            ('numero_documento', 'Número de Documento'),
+            ('nombre_completo', 'Nombre Completo'),
+            ('fecha_emision', 'Fecha de Emisión'),
+            ('fecha_expiracion', 'Fecha de Expiración'),
+            ('pais_emision', 'País de Emisión'),
+            ('genero', 'Género'),
+            ('lugar_nacimiento', 'Lugar de Nacimiento'),
+            ('autoridad_emision', 'Autoridad de Emisión'),
+            ('nacionalidad', 'Nacionalidad')
+        ]
+        
+        for campo, descripcion in campos:
+            valor_v1 = v1.get(campo)
+            valor_v2 = v2.get(campo)
+            
+            if valor_v1 != valor_v2:
+                comparison['cambios'][campo] = {
+                    'descripcion': descripcion,
+                    'antes': valor_v1,
+                    'despues': valor_v2
+                }
+                comparison['resumen'].append(f"{descripcion}: '{valor_v1}' → '{valor_v2}'")
+        
+        comparison['total_cambios'] = len(comparison['cambios'])
+        
+        return comparison
+        
+    except Exception as e:
+        logger.error(f"Error al comparar versiones de identificación: {str(e)}")
+        raise
+
+def restore_identification_version(document_id, version_number, restored_by):
+    """
+    Restaura una versión anterior de los datos de identificación
+    """
+    connection = get_connection()
+    try:
+        connection.begin()
+        
+        with connection.cursor() as cursor:
+            # Obtener datos de la versión a restaurar
+            query = """
+            SELECT h.* 
+            FROM historico_documentos_identificacion h
+            JOIN versiones_documento v ON h.id_version = v.id_version
+            WHERE h.id_documento = %s AND v.numero_version = %s
+            ORDER BY h.fecha_preservacion DESC
+            LIMIT 1
+            """
+            
+            cursor.execute(query, (document_id, version_number))
+            historical_data = cursor.fetchone()
+            
+            if not historical_data:
+                raise ValueError(f"No se encontraron datos históricos para la versión {version_number}")
+            
+            # Preservar datos actuales antes de restaurar
+            preserve_identification_data(document_id, reason=f"Antes de restaurar a versión {version_number}")
+            
+            # Actualizar con los datos históricos
+            update_query = """
+            UPDATE documentos_identificacion
+            SET tipo_documento = %s,
+                numero_documento = %s,
+                pais_emision = %s,
+                fecha_emision = %s,
+                fecha_expiracion = %s,
+                nombre_completo = %s,
+                genero = %s,
+                lugar_nacimiento = %s,
+                autoridad_emision = %s,
+                nacionalidad = %s,
+                codigo_pais = %s
+            WHERE id_documento = %s
+            """
+            
+            cursor.execute(update_query, (
+                historical_data['tipo_documento'],
+                historical_data['numero_documento'],
+                historical_data['pais_emision'],
+                historical_data['fecha_emision'],
+                historical_data['fecha_expiracion'],
+                historical_data['nombre_completo'],
+                historical_data['genero'],
+                historical_data['lugar_nacimiento'],
+                historical_data['autoridad_emision'],
+                historical_data['nacionalidad'],
+                historical_data['codigo_pais'],
+                document_id
+            ))
+            
+            # Registrar en auditoría
+            audit_data = {
+                'fecha_hora': datetime.now().isoformat(),
+                'usuario_id': restored_by,
+                'direccion_ip': '0.0.0.0',
+                'accion': 'restaurar_datos_identificacion',
+                'entidad_afectada': 'documentos_identificacion',
+                'id_entidad_afectada': document_id,
+                'detalles': json.dumps({
+                    'version_restaurada': version_number,
+                    'numero_documento': historical_data['numero_documento']
+                }),
+                'resultado': 'éxito'
+            }
+            insert_audit_record(audit_data)
+            
+            connection.commit()
+            logger.info(f"Datos de identificación restaurados a versión {version_number} para documento {document_id}")
+            return True
+            
+    except Exception as e:
+        connection.rollback()
+        logger.error(f"Error al restaurar versión de identificación: {str(e)}")
+        raise
+    finally:
+        connection.close()
+
+# Función mejorada para get_version_id
+def get_version_id(document_id, version_number):
+    """
+    Obtiene el ID de versión para un documento y número de versión específicos.
+    VERSIÓN MEJORADA con manejo de errores y validaciones.
+    """
+    try:
+        if not document_id:
+            logger.error("document_id no puede ser None o vacío")
+            return None
+        
+        if not version_number or version_number < 1:
+            logger.error(f"version_number inválido: {version_number}")
+            return None
+        
+        query = """
+        SELECT id_version
+        FROM versiones_documento
+        WHERE id_documento = %s AND numero_version = %s
+        LIMIT 1
+        """
+        result = execute_query(query, (document_id, version_number))
+        
+        if not result:
+            logger.warning(f"No se encontró versión {version_number} para documento {document_id}")
+            return None
+            
+        version_id = result[0]['id_version']
+        logger.debug(f"Version ID encontrado: {version_id} para documento {document_id}, versión {version_number}")
+        return version_id
+        
+    except Exception as e:
+        logger.error(f"Error al obtener version_id para documento {document_id}, versión {version_number}: {str(e)}")
+        return None
+    
+# Nueva función para obtener información de análisis
+def get_analysis_info_by_id(analysis_id):
+    """
+    Obtiene información completa de un análisis por su ID
+    """
+    try:
+        query = """
+        SELECT a.*, d.titulo as documento_titulo, v.numero_version, v.nombre_original
+        FROM analisis_documento_ia a
+        JOIN documentos d ON a.id_documento = d.id_documento
+        LEFT JOIN versiones_documento v ON a.id_version = v.id_version
+        WHERE a.id_analisis = %s
+        """
+        result = execute_query(query, (analysis_id,))
+        return result[0] if result else None
+    except Exception as e:
+        logger.error(f"Error al obtener información de análisis {analysis_id}: {str(e)}")
+        return None
+
+# Nueva función para verificar integridad de versiones
+def verify_document_version_integrity(document_id):
+    """
+    Verifica la integridad de las versiones de un documento
+    """
+    try:
+        # Obtener información del documento
+        doc_query = """
+        SELECT id_documento, version_actual, titulo
+        FROM documentos
+        WHERE id_documento = %s
+        """
+        doc_result = execute_query(doc_query, (document_id,))
+        
+        if not doc_result:
+            return False, f"Documento {document_id} no encontrado"
+        
+        doc_info = doc_result[0]
+        version_actual = doc_info['version_actual']
+        
+        # Verificar que existe la versión actual
+        version_query = """
+        SELECT id_version, numero_version
+        FROM versiones_documento
+        WHERE id_documento = %s AND numero_version = %s
+        """
+        version_result = execute_query(version_query, (document_id, version_actual))
+        
+        if not version_result:
+            return False, f"Versión actual {version_actual} no encontrada"
+        
+        # Verificar continuidad de versiones (no debe haber saltos)
+        continuity_query = """
+        SELECT numero_version
+        FROM versiones_documento
+        WHERE id_documento = %s
+        ORDER BY numero_version
+        """
+        versions = execute_query(continuity_query, (document_id,))
+        
+        if versions:
+            version_numbers = [v['numero_version'] for v in versions]
+            expected_versions = list(range(1, len(version_numbers) + 1))
+            
+            if version_numbers != expected_versions:
+                return False, f"Discontinuidad en versiones: {version_numbers}, esperado: {expected_versions}"
+        
+        # Verificar que hay análisis para la versión actual
+        analysis_query = """
+        SELECT COUNT(*) as count
+        FROM analisis_documento_ia
+        WHERE id_documento = %s AND id_version = %s
+        """
+        analysis_result = execute_query(analysis_query, (document_id, version_result[0]['id_version']))
+        
+        has_analysis = analysis_result and analysis_result[0]['count'] > 0
+        
+        return True, {
+            'document_id': document_id,
+            'version_actual': version_actual,
+            'version_id': version_result[0]['id_version'],
+            'total_versions': len(versions) if versions else 0,
+            'has_analysis': has_analysis,
+            'titulo': doc_info['titulo']
+        }
+        
+    except Exception as e:
+        logger.error(f"Error verificando integridad de versiones para {document_id}: {str(e)}")
+        return False, str(e)
+
+# Función corregida para insert_analysis_record
+def insert_analysis_record(analysis_data):
+    """
+    Inserta un nuevo registro de análisis IA para un documento.
+    VERSIÓN CORREGIDA que maneja correctamente el campo id_version.
+    """
+    # Verificar que tenemos los campos requeridos
+    required_fields = ['id_analisis', 'id_documento', 'tipo_documento']
+    for field in required_fields:
+        if field not in analysis_data:
+            raise ValueError(f"Campo requerido faltante: {field}")
+    
+    # Establecer valores por defecto para campos opcionales
+    defaults = {
+        'id_version': None,
+        'confianza_clasificacion': 0.5,
+        'texto_extraido': None,
+        'entidades_detectadas': None,
+        'metadatos_extraccion': '{}',
+        'fecha_analisis': datetime.now().isoformat(),
+        'estado_analisis': 'iniciado',
+        'mensaje_error': None,
+        'version_modelo': 'default',
+        'tiempo_procesamiento': 0,
+        'procesado_por': 'sistema',
+        'requiere_verificacion': True,
+        'verificado': False,
+        'verificado_por': None,
+        'fecha_verificacion': None
+    }
+    
+    # Aplicar valores por defecto para campos faltantes
+    for key, default_value in defaults.items():
+        if key not in analysis_data:
+            analysis_data[key] = default_value
+    
+    query = """
+    INSERT INTO analisis_documento_ia (
+        id_analisis,
+        id_documento,
+        id_version,
+        tipo_documento,
+        confianza_clasificacion,
+        texto_extraido,
+        entidades_detectadas,
+        metadatos_extraccion,
+        fecha_analisis,
+        estado_analisis,
+        mensaje_error,
+        version_modelo,
+        tiempo_procesamiento,
+        procesado_por,
+        requiere_verificacion,
+        verificado,
+        verificado_por,
+        fecha_verificacion
+    ) VALUES (
+        %(id_analisis)s,
+        %(id_documento)s,
+        %(id_version)s,
+        %(tipo_documento)s,
+        %(confianza_clasificacion)s,
+        %(texto_extraido)s,
+        %(entidades_detectadas)s,
+        %(metadatos_extraccion)s,
+        %(fecha_analisis)s,
+        %(estado_analisis)s,
+        %(mensaje_error)s,
+        %(version_modelo)s,
+        %(tiempo_procesamiento)s,
+        %(procesado_por)s,
+        %(requiere_verificacion)s,
+        %(verificado)s,
+        %(verificado_por)s,
+        %(fecha_verificacion)s
+    )
+    """
+    
+    try:
+        result = execute_query(query, analysis_data, fetch=False)
+        logger.info(f"Registro de análisis {analysis_data['id_analisis']} insertado correctamente")
+        return result
+    except Exception as e:
+        logger.error(f"Error al insertar registro de análisis: {str(e)}")
+        logger.error(f"Datos del análisis: {json.dumps(analysis_data, default=str)}")
+        raise
+
+# Nueva función para limpiar análisis huérfanos
+def cleanup_orphaned_analysis():
+    """
+    Limpia registros de análisis que no tienen documento o versión asociada
+    """
+    try:
+        # Encontrar análisis huérfanos (sin documento)
+        orphaned_docs_query = """
+        SELECT a.id_analisis, a.id_documento
+        FROM analisis_documento_ia a
+        LEFT JOIN documentos d ON a.id_documento = d.id_documento
+        WHERE d.id_documento IS NULL
+        """
+        
+        orphaned_docs = execute_query(orphaned_docs_query)
+        
+        if orphaned_docs:
+            logger.warning(f"Encontrados {len(orphaned_docs)} análisis huérfanos sin documento")
+            
+            # Opcionalmente eliminar (comentado por seguridad)
+            # for orphan in orphaned_docs:
+            #     delete_query = "DELETE FROM analisis_documento_ia WHERE id_analisis = %s"
+            #     execute_query(delete_query, (orphan['id_analisis'],), fetch=False)
+        
+        # Encontrar análisis con versión inválida
+        orphaned_versions_query = """
+        SELECT a.id_analisis, a.id_documento, a.id_version
+        FROM analisis_documento_ia a
+        LEFT JOIN versiones_documento v ON a.id_version = v.id_version
+        WHERE a.id_version IS NOT NULL AND v.id_version IS NULL
+        """
+        
+        orphaned_versions = execute_query(orphaned_versions_query)
+        
+        if orphaned_versions:
+            logger.warning(f"Encontrados {len(orphaned_versions)} análisis con versión inválida")
+        
+        return {
+            'orphaned_documents': len(orphaned_docs) if orphaned_docs else 0,
+            'orphaned_versions': len(orphaned_versions) if orphaned_versions else 0
+        }
+        
+    except Exception as e:
+        logger.error(f"Error en limpieza de análisis huérfanos: {str(e)}")
+        return None
+
+# Nueva función para migrar análisis sin versión
+def migrate_analysis_without_version():
+    """
+    Migra registros de análisis que no tienen id_version asignado
+    """
+    try:
+        # Encontrar análisis sin versión
+        query = """
+        SELECT a.id_analisis, a.id_documento, d.version_actual
+        FROM analisis_documento_ia a
+        JOIN documentos d ON a.id_documento = d.id_documento
+        WHERE a.id_version IS NULL
+        """
+        
+        analysis_without_version = execute_query(query)
+        
+        if not analysis_without_version:
+            logger.info("No hay análisis sin versión para migrar")
+            return 0
+        
+        migrated_count = 0
+        
+        for analysis in analysis_without_version:
+            # Obtener version_id para la versión actual
+            version_id = get_version_id(analysis['id_documento'], analysis['version_actual'])
+            
+            if version_id:
+                # Actualizar el análisis con el version_id
+                update_query = """
+                UPDATE analisis_documento_ia
+                SET id_version = %s
+                WHERE id_analisis = %s
+                """
+                
+                execute_query(update_query, (version_id, analysis['id_analisis']), fetch=False)
+                migrated_count += 1
+                
+                logger.info(f"Migrado análisis {analysis['id_analisis']} a versión {version_id}")
+            else:
+                logger.error(f"No se pudo obtener version_id para documento {analysis['id_documento']}")
+        
+        logger.info(f"Migración completada: {migrated_count} análisis migrados")
+        return migrated_count
+        
+    except Exception as e:
+        logger.error(f"Error en migración de análisis: {str(e)}")
+        return -1    

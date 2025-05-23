@@ -1,4 +1,3 @@
-# src/textract_callback/app.py
 import os
 import json
 import boto3
@@ -45,12 +44,96 @@ try:
         update_document_extraction_data,
         update_analysis_record,
         get_document_type_by_id,
-        get_document_by_id
+        get_document_by_id,
+        get_version_id,
+        execute_query,
+        generate_uuid,
+        insert_analysis_record,
+        log_document_processing_start,
+        log_document_processing_end
     )
     from common.validation import guess_document_type
     logger.info("Módulos importados correctamente")
 except ImportError as e:
     logger.error(f"Error importando módulos: {str(e)}")
+
+# ========== FUNCIONES NUEVAS PARA CORRECCIONES ==========
+def get_analysis_id_for_document(document_id, version_id=None):
+    """
+    Obtiene el analysis_id para un documento y versión específicos
+    """
+    try:
+        if version_id:
+            query = """
+            SELECT id_analisis FROM analisis_documento_ia 
+            WHERE id_documento = %s AND id_version = %s
+            ORDER BY fecha_analisis DESC LIMIT 1
+            """
+            result = execute_query(query, (document_id, version_id))
+        else:
+            query = """
+            SELECT id_analisis FROM analisis_documento_ia 
+            WHERE id_documento = %s
+            ORDER BY fecha_analisis DESC LIMIT 1
+            """
+            result = execute_query(query, (document_id,))
+        
+        return result[0]['id_analisis'] if result else None
+    except Exception as e:
+        logger.error(f"Error al obtener analysis_id: {str(e)}")
+        return None
+
+def create_analysis_record_for_version(document_id, version_id, analysis_id):
+    """
+    Crea un registro de análisis básico para una versión específica
+    """
+    try:
+        analysis_data = {
+            'id_analisis': analysis_id,
+            'id_documento': document_id,
+            'id_version': version_id,
+            'tipo_documento': 'documento',
+            'estado_analisis': 'iniciado',
+            'fecha_analisis': datetime.now().isoformat(),
+            'confianza_clasificacion': 0.5,
+            'texto_extraido': None,
+            'entidades_detectadas': None,
+            'metadatos_extraccion': json.dumps({'created_by': 'textract_callback'}),
+            'mensaje_error': None,
+            'version_modelo': 'textract-initial',
+            'tiempo_procesamiento': 0,
+            'procesado_por': 'textract_callback',
+            'requiere_verificacion': True,
+            'verificado': False,
+            'verificado_por': None,
+            'fecha_verificacion': None
+        }
+        
+        insert_analysis_record(analysis_data)
+        return True
+    except Exception as e:
+        logger.error(f"Error al crear registro de análisis: {str(e)}")
+        return False
+
+def validate_document_version_consistency(document_id):
+    """
+    Valida que la consistencia entre documento, versiones y análisis sea correcta
+    """
+    try:
+        doc = get_document_by_id(document_id)
+        if not doc:
+            return False, f"Documento {document_id} no existe"
+        
+        version_actual = doc.get('version_actual', 1)
+        version_id = get_version_id(document_id, version_actual)
+        if not version_id:
+            return False, f"Versión actual {version_actual} no existe"
+        
+        return True, "Consistencia validada"
+    except Exception as e:
+        return False, f"Error en validación: {str(e)}"
+
+# ========== FUNCIONES AUXILIARES ORIGINALES ==========
 
 def get_document_id_from_job_tag(job_tag):
     """Extrae el ID del documento desde el job tag"""
@@ -117,6 +200,7 @@ def get_textract_results(job_id, job_type='DOCUMENT_ANALYSIS'):
         logger.error(f"Error al obtener resultados de Textract: {str(e)}")
         return [], 0
 
+# ========== FUNCIÓN DE EXTRACCIÓN COMPLETA ==========
 def extract_complete_data_from_textract(textract_results):
     """
     Extrae TODOS los datos posibles de los resultados de Textract en un solo procesamiento.
@@ -725,10 +809,7 @@ def extract_financial_statement_data(text, forms, structured_data):
         if match:
             data['saldo_final'] = match.group(1).strip()
             break
-    
-    # Para movimientos, necesitaríamos las tablas del extracto
-    # Esto ya se incluye en el extraction de tablas general
-    
+        
     return data
 
 def extract_payroll_data(text, forms, structured_data):
@@ -1049,8 +1130,15 @@ def determine_processor_queue(doc_type):
 def lambda_handler(event, context):
     """
     Función que maneja las notificaciones de finalización de Textract.
-    Se activa por eventos SNS de Textract.
+    VERSIÓN CORREGIDA con manejo adecuado de versiones.
     """
+    # Registrar inicio del procesamiento
+    callback_registro_id = log_document_processing_start(
+        'textract_callback',
+        'procesar_callback_textract',
+        datos_entrada={"sns_records": len(event.get('Records', []))}
+    )
+    
     try:
         logger.info(f"Evento recibido: {json.dumps(event)}")
         
@@ -1068,40 +1156,190 @@ def lambda_handler(event, context):
         document_id = get_document_id_from_job_tag(job_tag)
         doc_type = get_document_type_from_job_tag(job_tag)
         
+        # Registrar procesamiento específico del documento
+        doc_registro_id = log_document_processing_start(
+            document_id,
+            'callback_textract_documento',
+            datos_entrada={"job_id": job_id, "status": status, "job_tag": job_tag},
+            analisis_id=callback_registro_id
+        )
+        
         # Determinar tipo de trabajo
         job_type = 'DOCUMENT_ANALYSIS'  # Por defecto
         if '_textract_detection' in job_tag:
             job_type = 'DOCUMENT_TEXT_DETECTION'
         
         if status == 'SUCCEEDED':
+            # CORRECCIÓN 1: Validar consistencia del documento antes de proceder
+            consistency_check_id = log_document_processing_start(
+                document_id,
+                'validar_consistencia_version',
+                datos_entrada={"job_id": job_id},
+                analisis_id=doc_registro_id
+            )
+            
+            is_consistent, consistency_message = validate_document_version_consistency(document_id)
+            
+            log_document_processing_end(
+                consistency_check_id,
+                estado='completado' if is_consistent else 'advertencia',
+                mensaje_error=None if is_consistent else consistency_message,
+                datos_procesados={"consistent": is_consistent}
+            )
+            
+            if not is_consistent:
+                logger.warning(f"Inconsistencia detectada: {consistency_message}")
+            
+            # CORRECCIÓN 2: Obtener información completa del documento
+            doc_info = get_document_by_id(document_id)
+            if not doc_info:
+                logger.error(f"No se encontró el documento {document_id}")
+                
+                log_document_processing_end(
+                    doc_registro_id,
+                    estado='error',
+                    mensaje_error=f"Documento {document_id} no encontrado"
+                )
+                
+                return {
+                    'statusCode': 404,
+                    'body': json.dumps({'error': 'Documento no encontrado'})
+                }
+            
+            # CORRECCIÓN 3: Obtener version_id correctamente
+            version_actual = doc_info.get('version_actual', 1)
+            version_id = get_version_id(document_id, version_actual)
+            
+            if not version_id:
+                logger.error(f"No se encontró version_id para documento {document_id}, versión {version_actual}")
+                
+                log_document_processing_end(
+                    doc_registro_id,
+                    estado='error',
+                    mensaje_error=f"Version ID no encontrado para versión {version_actual}"
+                )
+                
+                # Generar UUID temporal para no fallar el proceso
+                version_id = generate_uuid()
+                logger.warning(f"Usando version_id temporal: {version_id}")
+            
+            logger.info(f"Procesando documento {document_id}, versión {version_actual}, version_id: {version_id}")
+            
             # Obtener resultados completos de Textract
+            textract_get_id = log_document_processing_start(
+                document_id,
+                'obtener_resultados_textract',
+                datos_entrada={"job_id": job_id, "job_type": job_type},
+                analisis_id=doc_registro_id
+            )
+            
             textract_results, processing_time = get_textract_results(job_id, job_type)
             
             if not textract_results:
                 logger.error(f"No se pudieron obtener resultados para el Job {job_id}")
+                
+                log_document_processing_end(
+                    textract_get_id,
+                    estado='error',
+                    mensaje_error=f"No se pudieron obtener resultados para Job {job_id}"
+                )
+                
                 update_document_processing_status(
                     document_id, 
                     'error',
                     f"No se pudieron obtener resultados para el Job {job_id}"
                 )
+                
+                log_document_processing_end(
+                    doc_registro_id,
+                    estado='error',
+                    mensaje_error=f"Error obteniendo resultados de Textract"
+                )
+                
                 return {
                     'statusCode': 500,
                     'body': 'Error al obtener resultados de Textract'
                 }
             
+            log_document_processing_end(
+                textract_get_id,
+                estado='completado',
+                datos_procesados={"pages_count": len(textract_results)},
+                duracion_ms=int(processing_time * 1000)
+            )
+            
             # Extraer TODOS los datos posibles en un único proceso
+            extraction_id = log_document_processing_start(
+                document_id,
+                'extraer_datos_completos',
+                datos_entrada={"pages_count": len(textract_results)},
+                analisis_id=doc_registro_id
+            )
+            
             logger.info(f"Extrayendo datos completos para documento {document_id}")
             all_extracted_data = extract_complete_data_from_textract(textract_results)
+            
+            log_document_processing_end(
+                extraction_id,
+                estado='completado',
+                datos_procesados={
+                    "text_length": len(all_extracted_data.get('full_text', '')),
+                    "tables_count": len(all_extracted_data.get('tables', [])),
+                    "forms_count": len(all_extracted_data.get('forms', {}))
+                },
+                duracion_ms=int(all_extracted_data.get('processing_time', 0) * 1000)
+            )
             
             # Calcular confianza global
             confidence = all_extracted_data['doc_type_info']['confidence']
             doc_type_identified = all_extracted_data['doc_type_info']['document_type']
             
+            # CORRECCIÓN 4: Obtener o crear analysis_id correctamente
+            analysis_lookup_id = log_document_processing_start(
+                document_id,
+                'obtener_analysis_id',
+                datos_entrada={"version_id": version_id},
+                analisis_id=doc_registro_id
+            )
+            
+            analysis_id = get_analysis_id_for_document(document_id, version_id)
+            
+            if not analysis_id:
+                # Si no existe, crear uno nuevo
+                analysis_id = generate_uuid()
+                logger.info(f"Creando nuevo analysis_id: {analysis_id} para versión {version_id}")
+                
+                # Crear registro de análisis básico
+                create_success = create_analysis_record_for_version(document_id, version_id, analysis_id)
+                if not create_success:
+                    logger.error(f"Error al crear registro de análisis para documento {document_id}")
+                
+                log_document_processing_end(
+                    analysis_lookup_id,
+                    estado='completado',
+                    datos_procesados={"analysis_id": analysis_id, "created_new": True}
+                )
+            else:
+                logger.info(f"Usando analysis_id existente: {analysis_id}")
+                
+                log_document_processing_end(
+                    analysis_lookup_id,
+                    estado='completado',
+                    datos_procesados={"analysis_id": analysis_id, "created_new": False}
+                )
+            
             # Registrar datos extraídos en base de datos
+            db_update_id = log_document_processing_start(
+                document_id,
+                'actualizar_base_datos',
+                datos_entrada={"analysis_id": analysis_id, "confidence": confidence},
+                analisis_id=doc_registro_id
+            )
+            
             try:
-                # 1. Actualizar el registro de análisis con TODOS los datos extraídos
-                update_analysis_record(
-                    document_id,
+                # CORRECCIÓN 5: Actualizar el registro de análisis con parámetros correctos
+                update_success = update_analysis_record(
+                    analysis_id,  # ✅ CORRECTO: Usar analysis_id, no document_id
                     all_extracted_data['full_text'],  # Texto completo extraído
                     json.dumps(all_extracted_data['structured_data']),  # Entidades detectadas
                     json.dumps({  # Metadatos de extracción
@@ -1110,7 +1348,9 @@ def lambda_handler(event, context):
                         'tables_count': len(all_extracted_data['tables']),
                         'forms_count': len(all_extracted_data['forms']),
                         'text_blocks_count': len(all_extracted_data['text_blocks']),
-                        'processing_time': all_extracted_data['processing_time']
+                        'processing_time': all_extracted_data['processing_time'],
+                        'version_actual': version_actual,
+                        'version_id': version_id
                     }),
                     'textract_completado',  # Estado de análisis
                     f"textract-{job_type}",  # Versión del modelo
@@ -1120,8 +1360,12 @@ def lambda_handler(event, context):
                     False,  # No verificado aún
                     mensaje_error=None,
                     confianza_clasificacion=confidence,
-                    tipo_documento=doc_type_identified
+                    tipo_documento=doc_type_identified,
+                    id_version=version_id  # ✅ AGREGAR: Pasar version_id
                 )
+                
+                if not update_success:
+                    raise Exception("No se pudo actualizar el registro de análisis")
                 
                 # 2. Actualizar documento con todos los datos extraídos
                 extraction_data = {
@@ -1131,7 +1375,12 @@ def lambda_handler(event, context):
                     'tables': all_extracted_data['tables'],
                     'forms': all_extracted_data['forms'],
                     'structured_data': all_extracted_data['structured_data'],
-                    'specific_data': all_extracted_data['specific_data']
+                    'specific_data': all_extracted_data['specific_data'],
+                    'version_info': {
+                        'version_actual': version_actual,
+                        'version_id': version_id,
+                        'processed_by': 'textract_callback'
+                    }
                 }
                 
                 update_document_extraction_data(
@@ -1141,57 +1390,154 @@ def lambda_handler(event, context):
                     False  # No validado aún
                 )
                 
-                logger.info(f"Datos extraídos guardados correctamente para documento {document_id}")
+                logger.info(f"Datos extraídos guardados correctamente para documento {document_id}, versión {version_actual}")
                 
                 # 3. Actualizar estado de procesamiento
                 update_document_processing_status(
                     document_id, 
                     'textract_completado',
-                    f"Extracción completada con confianza {confidence:.2f}"
+                    f"Extracción completada con confianza {confidence:.2f} para versión {version_actual}",
+                    tipo_documento=doc_type_identified
+                )
+                
+                log_document_processing_end(
+                    db_update_id,
+                    estado='completado',
+                    confianza=confidence,
+                    datos_procesados={
+                        "analysis_updated": True,
+                        "document_updated": True,
+                        "status_updated": True
+                    }
                 )
                 
                 # 4. Determinar la cola SQS para el siguiente paso de procesamiento
-                # basado en el tipo de documento identificado
+                queue_determination_id = log_document_processing_start(
+                    document_id,
+                    'determinar_cola_siguiente',
+                    datos_entrada={"doc_type": doc_type_identified},
+                    analisis_id=doc_registro_id
+                )
+                
                 queue_url = determine_processor_queue(doc_type_identified)
+                
+                log_document_processing_end(
+                    queue_determination_id,
+                    estado='completado',
+                    datos_procesados={"queue_url": queue_url}
+                )
                 
                 # 5. Crear mensaje para el procesador específico
                 # IMPORTANTE: Solo enviamos la referencia al documento, no los datos completos
-                # Los datos ya están en la base de datos
+                # Los datos ya están en la base de datos con la versión correcta
                 message = {
                     'document_id': document_id,
                     'document_type': doc_type_identified,
                     'confidence': confidence,
                     'extraction_complete': True,  # Indicar que ya se ha completado la extracción
-                    'specific_data_available': bool(all_extracted_data['specific_data'])
+                    'specific_data_available': bool(all_extracted_data['specific_data']),
+                    'version_info': {
+                        'version_actual': version_actual,
+                        'version_id': version_id,
+                        'analysis_id': analysis_id
+                    }
                 }
                 
                 # 6. Enviar a cola SQS
+                sqs_send_id = log_document_processing_start(
+                    document_id,
+                    'enviar_cola_sqs',
+                    datos_entrada={"queue_url": queue_url, "message_size": len(json.dumps(message))},
+                    analisis_id=doc_registro_id
+                )
+                
                 sqs_client.send_message(
                     QueueUrl=queue_url,
                     MessageBody=json.dumps(message)
                 )
                 
-                logger.info(f"Documento {document_id} enviado a procesador específico: {queue_url}")
+                log_document_processing_end(
+                    sqs_send_id,
+                    estado='completado',
+                    datos_procesados={"queue_url": queue_url}
+                )
+                
+                logger.info(f"Documento {document_id} (versión {version_actual}) enviado a procesador específico: {queue_url}")
+                
+                log_document_processing_end(
+                    doc_registro_id,
+                    estado='completado',
+                    confianza=confidence,
+                    datos_procesados={
+                        "document_type": doc_type_identified,
+                        "version_actual": version_actual,
+                        "analysis_id": analysis_id,
+                        "next_queue": queue_url
+                    }
+                )
                 
             except Exception as db_error:
                 logger.error(f"Error al guardar datos extraídos: {str(db_error)}")
+                
+                log_document_processing_end(
+                    db_update_id,
+                    estado='error',
+                    mensaje_error=str(db_error)
+                )
+                
                 update_document_processing_status(
                     document_id, 
                     'error',
                     f"Error al guardar datos extraídos: {str(db_error)}"
                 )
                 
+                log_document_processing_end(
+                    doc_registro_id,
+                    estado='error',
+                    mensaje_error=f"Error en base de datos: {str(db_error)}"
+                )
+                
+                return {
+                    'statusCode': 500,
+                    'body': json.dumps({
+                        'error': 'Error al procesar datos extraídos',
+                        'details': str(db_error)
+                    })
+                }
+                
         else:
-            # Actualizar estado en caso de error
+            # Manejar estados de error de Textract
             error_message = f"Error en el procesamiento Textract: {status}"
+            
             update_document_processing_status(document_id, 'error', error_message)
             logger.error(error_message)
+            
+            log_document_processing_end(
+                doc_registro_id,
+                estado='error',
+                mensaje_error=error_message
+            )
+        
+        # Finalizar procesamiento exitoso
+        log_document_processing_end(
+            callback_registro_id,
+            estado='completado',
+            datos_procesados={
+                "document_id": document_id,
+                "status": status,
+                "processed_successfully": status == 'SUCCEEDED'
+            }
+        )
         
         return {
             'statusCode': 200,
             'body': json.dumps({
                 'document_id': document_id,
                 'status': status,
+                'version_info': {
+                    'version_actual': version_actual if status == 'SUCCEEDED' else None,
+                    'version_id': version_id if status == 'SUCCEEDED' else None
+                },
                 'message': 'Procesamiento de notificación de Textract completado'
             })
         }
@@ -1209,6 +1555,13 @@ def lambda_handler(event, context):
             )
         except Exception:
             logger.error("No se pudo actualizar estado del documento")
+        
+        # Finalizar procesamiento con error
+        log_document_processing_end(
+            callback_registro_id,
+            estado='error',
+            mensaje_error=str(e)
+        )
         
         return {
             'statusCode': 500,
