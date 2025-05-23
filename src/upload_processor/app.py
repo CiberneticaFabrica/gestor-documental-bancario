@@ -44,8 +44,9 @@ try:
         generate_uuid, update_document_processing_status, get_document_type_by_id,
         get_banking_doc_category, insert_audit_record, update_analysis_record,
         link_document_to_client,get_document_by_id,execute_query,log_document_processing_start,
-        log_document_processing_end,update_document_extraction_data_with_type_preservation,
-        assign_folder_and_link,get_client_id_by_document
+        log_document_processing_end,preserve_document_data_before_update,verify_document_version_integrity,
+        get_document_version_history,restore_document_version,compare_document_versions,
+        get_latest_extraction_data
     )
     from common.s3_utils import get_file_metadata, copy_s3_object, delete_s3_object
     from common.validation import validate_document, determine_document_type, get_document_expiry_info
@@ -252,10 +253,13 @@ def process_with_pypdf2(document_id, bucket, key, document_type_info, metadata):
         return False
 
 def start_textract_processing(document_id, bucket, key, document_type_info=None, preliminary_classification=None):
-    """Inicia el procesamiento asíncrono con Textract"""
+    """
+    Inicia el procesamiento asíncrono con Textract.
+    VERSIÓN MEJORADA con mejor manejo de metadatos del job.
+    """
     textract_registro_id = log_document_processing_start(
         document_id, 
-        'iniciar_textract',
+        'iniciar_textract_mejorado',
         datos_entrada={
             "bucket": bucket, 
             "key": key, 
@@ -267,26 +271,28 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
         # Verificar que tengamos las variables de entorno necesarias
         if not TEXTRACT_SNS_TOPIC or not TEXTRACT_ROLE_ARN:
             logger.warning("Variables de entorno para Textract asíncrono no configuradas")
+            
             # Enviar directamente a clasificación sin procesamiento Textract
-            message = {
+            fallback_message = {
                 'document_id': document_id,
                 'bucket': bucket,
                 'key': key,
                 'skip_textract': True,
                 'document_type_info': document_type_info,
-                'preliminary_classification': preliminary_classification
+                'preliminary_classification': preliminary_classification,
+                'reason': 'sns_not_configured'
             }
             
             sqs_registro_id = log_document_processing_start(
                 document_id, 
                 'enviar_sqs_sin_textract',
-                datos_entrada={"skip_textract": True},
+                datos_entrada={"skip_textract": True, "reason": "sns_not_configured"},
                 analisis_id=textract_registro_id
             )
             
             sqs_client.send_message(
                 QueueUrl=CLASSIFICATION_QUEUE_URL,
-                MessageBody=json.dumps(message)
+                MessageBody=json.dumps(fallback_message)
             )
             
             log_document_processing_end(
@@ -303,11 +309,17 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
                 mensaje_error="SNS no configurado, proceso saltado"
             )
             
-            return False
+            return True  # Consideramos exitoso aunque no use Textract
             
+        # Obtener información de versión actual para incluir en job tag
+        doc_info = get_document_by_id(document_id)
+        version_actual = doc_info.get('version_actual', 1) if doc_info else 1
+        
         # Optimización: Determinar el tipo de análisis según el tipo de documento
         feature_types = ['TABLES', 'FORMS']
-        job_tag = f"{document_id}_textract"
+        
+        # Crear job_tag más informativo que incluya versión
+        job_tag = f"{document_id}_v{version_actual}_textract"
         
         # Personalizar análisis según el tipo de documento preliminar
         if preliminary_classification and preliminary_classification.get('doc_type'):
@@ -316,20 +328,20 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
             # Para contratos usamos análisis más completo
             if doc_type == 'contrato':
                 feature_types = ['TABLES', 'FORMS', 'QUERIES']
-                job_tag = f"{document_id}_contract_analysis"
+                job_tag = f"{document_id}_v{version_actual}_contract_analysis"
             
             # Para documentos de identidad priorizamos el texto
             elif doc_type in ['dni', 'pasaporte']:
                 feature_types = ['FORMS']
-                job_tag = f"{document_id}_id_analysis"
+                job_tag = f"{document_id}_v{version_actual}_id_analysis"
                 
             # Para documentos financieros priorizamos tablas
             elif doc_type in ['extracto', 'nomina', 'impuesto']:
                 feature_types = ['TABLES', 'FORMS']
-                job_tag = f"{document_id}_financial_analysis"
+                job_tag = f"{document_id}_v{version_actual}_financial_analysis"
         
         # Configurar notificación SNS para cuando termine el proceso
-        logger.info(f"Iniciando procesamiento asíncrono con Textract para {document_id}")
+        logger.info(f"Iniciando procesamiento asíncrono con Textract para {document_id} v{version_actual}")
         
         # Preparamos parámetros de Textract optimizados
         textract_params = {
@@ -340,7 +352,7 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
                 }
             },
             'FeatureTypes': feature_types,
-            'JobTag': job_tag,
+            'JobTag': job_tag,  # ✅ Job tag mejorado con versión
             'NotificationChannel': {
                 'SNSTopicArn': TEXTRACT_SNS_TOPIC,
                 'RoleArn': TEXTRACT_ROLE_ARN
@@ -349,15 +361,28 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
         
         # Añadir QueriesConfig si es un contrato u otro documento complejo
         if 'QUERIES' in feature_types:
-            # Especificar consultas que extraerán información clave en una sola llamada
             textract_params['QueriesConfig'] = {
                 'Queries': [
-                    {'Text': 'What is the document type?'},
-                    {'Text': 'What is the document number?'},
-                    {'Text': 'What is the issue date?'},
-                    {'Text': 'What is the expiration date?'},
-                    {'Text': 'Who is the person named in this document?'},
-                    {'Text': 'What is the main purpose of this document?'}
+                    {'Text': '¿Cuál es el nombre completo del titular?'},
+                    {'Text': '¿Cuál es el número de pasaporte?'},
+                    {'Text': '¿Cuál es la nacionalidad?'},
+                    {'Text': '¿Cuál es la fecha de nacimiento?'},
+                    {'Text': '¿Cuál es el sexo?'},
+                    {'Text': '¿Cuál es la autoridad emisora del pasaporte?'},
+                    {'Text': '¿Cuál es la fecha de expedición del pasaporte?'},
+                    {'Text': '¿Cuál es la fecha de expiración del pasaporte?'},
+                    {'Text': '¿Cuál es el país de emisión del pasaporte?'},
+                    {'Text': '¿Qué tipo de pasaporte es (ordinario, diplomático)?'},
+                    {'Text': '¿Cuál es el nombre completo?'},
+                    {'Text': '¿Cuál es la cédula o número de identificación?'},
+                    {'Text': '¿Cuál es la fecha de nacimiento?'},
+                    {'Text': '¿Cuál es el lugar de nacimiento?'},
+                    {'Text': '¿Cuál es el sexo?'},
+                    {'Text': '¿Cuál es el tipo de sangre?'},
+                    {'Text': '¿Cuál es la fecha de expedición?'},
+                    {'Text': '¿Cuál es la fecha de expiración?'},
+                    {'Text': '¿Qué entidad emitió este documento?'},
+                    {'Text': '¿Cuál es el propósito del documento?'}
                 ]
             }
         
@@ -365,26 +390,38 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
         start_job_registro_id = log_document_processing_start(
             document_id, 
             'textract_start_job',
-            datos_entrada={"feature_types": feature_types, "job_tag": job_tag},
+            datos_entrada={
+                "feature_types": feature_types, 
+                "job_tag": job_tag,
+                "version": version_actual
+            },
             analisis_id=textract_registro_id
         )
         
         textract_response = textract_client.start_document_analysis(**textract_params)
         
         job_id = textract_response['JobId']
-        logger.info(f"Iniciado procesamiento asíncrono de Textract: JobId={job_id}")
+        logger.info(f"Iniciado procesamiento asíncrono de Textract: JobId={job_id} para documento {document_id} v{version_actual}")
         
         log_document_processing_end(
             start_job_registro_id, 
             estado='completado',
-            datos_procesados={"job_id": job_id}
+            datos_procesados={
+                "job_id": job_id,
+                "job_tag": job_tag,
+                "version": version_actual
+            }
         )
         
-        # Actualizar en la base de datos con todos los detalles
+        # Actualizar en la base de datos con todos los detalles incluyendo versión
         update_status_registro_id = log_document_processing_start(
             document_id, 
             'actualizar_estado_textract',
-            datos_entrada={"job_id": job_id, "feature_types": feature_types},
+            datos_entrada={
+                "job_id": job_id, 
+                "version": version_actual,
+                "feature_types": feature_types
+            },
             analisis_id=textract_registro_id
         )
         
@@ -395,9 +432,15 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
                 json.dumps({
                     'textract_job_id': job_id,
                     'textract_job_type': 'ANALYSIS',
+                    'textract_job_tag': job_tag,
                     'feature_types': feature_types,
-                    'preliminary_classification': preliminary_classification
-                })
+                    'preliminary_classification': preliminary_classification,
+                    'version_info': {
+                        'version_actual': version_actual,
+                        'processed_at': datetime.now().isoformat()
+                    }
+                }),
+                tipo_documento=preliminary_classification.get('doc_type') if preliminary_classification else None
             )
             
             log_document_processing_end(
@@ -407,6 +450,7 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
             
         except Exception as db_error:
             logger.error(f"Error al actualizar estado en BD: {str(db_error)}, pero continuando procesamiento")
+            
             log_document_processing_end(
                 update_status_registro_id, 
                 estado='error',
@@ -416,13 +460,19 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
         log_document_processing_end(
             textract_registro_id, 
             estado='completado',
-            datos_procesados={"job_id": job_id, "feature_types": feature_types}
+            datos_procesados={
+                "job_id": job_id, 
+                "job_tag": job_tag,
+                "feature_types": feature_types,
+                "version": version_actual
+            }
         )
         
         return True
         
     except Exception as e:
         logger.error(f"Error al iniciar procesamiento Textract: {str(e)}")
+        
         # En caso de error, enviar directamente a la cola de clasificación
         try:
             error_sqs_registro_id = log_document_processing_start(
@@ -432,7 +482,7 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
                 analisis_id=textract_registro_id
             )
             
-            message = {
+            error_message = {
                 'document_id': document_id,
                 'bucket': bucket,
                 'key': key,
@@ -445,7 +495,7 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
             
             sqs_client.send_message(
                 QueueUrl=CLASSIFICATION_QUEUE_URL,
-                MessageBody=json.dumps(message)
+                MessageBody=json.dumps(error_message)
             )
             
             log_document_processing_end(
@@ -455,8 +505,10 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
             )
             
             logger.info(f"Documento {document_id} enviado a clasificación tras error en Textract")
+            
         except Exception as sqs_error:
             logger.error(f"Error al enviar mensaje a SQS: {str(sqs_error)}")
+            
             if 'error_sqs_registro_id' in locals():
                 log_document_processing_end(
                     error_sqs_registro_id, 
@@ -508,13 +560,12 @@ def process_document_metadata(document_id, metadata, bucket, key):
         requiere_validacion = cat_info.get('requiere_validacion', True) if cat_info else True
         validez_dias = cat_info.get('validez_en_dias') if cat_info else None
         
-
         # Obtener ID del cliente desde metadatos de S3 si existe
-       
         client_id = None
         try:
             s3_response = s3_client.head_object(Bucket=bucket, Key=key)
             client_id = s3_response.get('Metadata', {}).get('client-id')
+             
         except Exception as e:
             logger.warning(f"No se pudieron obtener metadatos adicionales: {str(e)}")
         
@@ -718,39 +769,40 @@ def process_new_document(document_id, file_metadata, dest_bucket, dest_key, clie
         
         doc_metadata = process_document_metadata(document_id, file_metadata, dest_bucket, dest_key)
         
+
         log_document_processing_end(
             metadata_registro_id, 
             estado='completado',
             datos_procesados={"document_type_id": doc_metadata.get('document_type_id')}
         )
 
-        # Vincular documento al cliente si client_id existe
-        if client_id:
-            link_registro_id = log_document_processing_start(
-                document_id, 
-                'vincular_cliente_nuevo',
-                datos_entrada={"client_id": client_id},
-                analisis_id=process_doc_registro_id
-            )
+        # Vincular documento al cliente si client_id existe ya se llama en metadata
+        #if client_id:
+        #    link_registro_id = log_document_processing_start(
+        #        document_id, 
+        #        'vincular_cliente_nuevo',
+        #        datos_entrada={"client_id": client_id},
+        #        analisis_id=process_doc_registro_id
+        #    )
             
-            try:
-                link_result = link_document_to_client(document_id, client_id)
-                logger.info(f"Documento {document_id} vinculado a cliente {client_id}: {link_result}")
+        #    try:
+        #        link_result = link_document_to_client(document_id, client_id)
+        #        logger.info(f"Documento {document_id} vinculado a cliente {client_id}: {link_result}")
                 
-                log_document_processing_end(
-                    link_registro_id, 
-                    estado='completado',
-                    datos_procesados={"link_result": link_result}
-                )
+        #        log_document_processing_end(
+        #            link_registro_id, 
+        #            estado='completado',
+        #            datos_procesados={"link_result": link_result}
+        #        )
                 
-            except Exception as link_error:
-                logger.error(f"Error al vincular documento con cliente: {str(link_error)}")
+        #    except Exception as link_error:
+        #        logger.error(f"Error al vincular documento con cliente: {str(link_error)}")
                 
-                log_document_processing_end(
-                    link_registro_id, 
-                    estado='error',
-                    mensaje_error=str(link_error)
-                )
+        #        log_document_processing_end(
+        #            link_registro_id, 
+        #            estado='error',
+        #            mensaje_error=str(link_error)
+        #        )
         
         # Determinar qué procesamiento adicional necesita (textract, etc.)
         classification_registro_id = log_document_processing_start(
@@ -875,11 +927,15 @@ def process_new_document(document_id, file_metadata, dest_bucket, dest_key, clie
         
         return False
 
+# Modificaciones para src/upload_processor/app.py
 def process_new_document_version(document_id, file_metadata, dest_bucket, dest_key, client_id=None):
-    """Procesa una nueva versión de un documento existente."""
+    """
+    Procesa una nueva versión de un documento existente con preservación de datos.
+    VERSIÓN MEJORADA con mejor manejo de versiones y análisis.
+    """
     version_registro_id = log_document_processing_start(
         document_id, 
-        'procesar_nueva_version',
+        'procesar_nueva_version_mejorada',
         datos_entrada={
             "dest_bucket": dest_bucket, 
             "dest_key": dest_key, 
@@ -889,47 +945,99 @@ def process_new_document_version(document_id, file_metadata, dest_bucket, dest_k
     )
     
     try:
-        # Verificar que el documento existe en la base de datos
-        verify_doc_registro_id = log_document_processing_start(
-            document_id, 
-            'verificar_documento_existente',
-            datos_entrada={"document_id": document_id},
-            analisis_id=version_registro_id
-        )
-        
+        # 1. Verificar que el documento existe y obtener información completa
         existing_document = get_document_by_id(document_id)
-        
         if not existing_document:
             logger.error(f"No se encontró el documento {document_id} para actualizar versión")
             
             log_document_processing_end(
-                verify_doc_registro_id, 
+                version_registro_id,
                 estado='error',
                 mensaje_error=f"Documento {document_id} no encontrado"
             )
             
-            # Procesar como nuevo documento ya que el ID no existe
-            log_document_processing_end(
-                version_registro_id, 
-                estado='redirigido',
-                mensaje_error=f"Documento no encontrado, procesando como nuevo"
-            )
-            
+            # Crear como documento nuevo si no existe
             return process_new_document(document_id, file_metadata, dest_bucket, dest_key, client_id)
         
         logger.info(f"Documento existente encontrado: {document_id}")
         
-        log_document_processing_end(
-            verify_doc_registro_id, 
-            estado='completado',
-            datos_procesados={"documento_encontrado": True}
+        # 2. Verificar integridad de versiones antes de continuar
+        integrity_check_id = log_document_processing_start(
+            document_id,
+            'verificar_integridad_versiones',
+            datos_entrada={"version_actual": existing_document.get('version_actual')},
+            analisis_id=version_registro_id
         )
         
-        # Verificar el número de versión actual consultando la tabla versiones_documento
-        get_version_registro_id = log_document_processing_start(
+        is_valid, integrity_info = verify_document_version_integrity(document_id)
+        
+        if not is_valid:
+            logger.warning(f"Problemas de integridad detectados: {integrity_info}")
+            
+            log_document_processing_end(
+                integrity_check_id,
+                estado='advertencia',
+                mensaje_error=f"Integridad comprometida: {integrity_info}",
+                datos_procesados={"integrity_issues": True}
+            )
+        else:
+            logger.info(f"Integridad verificada: {integrity_info}")
+            
+            log_document_processing_end(
+                integrity_check_id,
+                estado='completado',
+                datos_procesados=integrity_info
+            )
+        
+        # 3. IMPORTANTE: Preservar datos actuales antes de crear nueva versión
+        preserve_registro_id = log_document_processing_start(
             document_id, 
-            'obtener_version_actual',
-            datos_entrada={"document_id": document_id},
+            'preservar_datos_version_actual',
+            datos_entrada={"version_actual": existing_document.get('version_actual')},
+            analisis_id=version_registro_id
+        )
+        
+        try:
+            # Preservar datos extraídos actuales si existen
+            if existing_document.get('datos_extraidos_ia'):
+                preserve_success = preserve_document_data_before_update(
+                    document_id, 
+                    f"Nueva versión del documento - Preservación automática (v{existing_document.get('version_actual')} -> v{existing_document.get('version_actual', 0) + 1})"
+                )
+                
+                if preserve_success:
+                    logger.info(f"Datos de versión anterior preservados para documento {document_id}")
+                else:
+                    logger.warning(f"No se pudieron preservar completamente los datos anteriores")
+                
+                log_document_processing_end(
+                    preserve_registro_id,
+                    estado='completado' if preserve_success else 'advertencia',
+                    datos_procesados={"preserved": preserve_success}
+                )
+            else:
+                logger.info(f"No hay datos extraídos previos para preservar")
+                
+                log_document_processing_end(
+                    preserve_registro_id,
+                    estado='completado',
+                    datos_procesados={"no_data_to_preserve": True}
+                )
+                
+        except Exception as preserve_error:
+            logger.warning(f"Error al preservar datos anteriores: {str(preserve_error)}")
+            
+            log_document_processing_end(
+                preserve_registro_id,
+                estado='error',
+                mensaje_error=str(preserve_error)
+            )
+        
+        # 4. Obtener número de versión actual y calcular nueva versión
+        version_query_id = log_document_processing_start(
+            document_id,
+            'calcular_nueva_version',
+            datos_entrada={"current_version": existing_document.get('version_actual')},
             analisis_id=version_registro_id
         )
         
@@ -941,26 +1049,31 @@ def process_new_document_version(document_id, file_metadata, dest_bucket, dest_k
         
         version_result = execute_query(version_query, (document_id,))
         current_version = version_result[0]['ultima_version'] if version_result and version_result[0]['ultima_version'] else 0
-        
-        # El nuevo número de versión debe ser mayor al máximo existente
         new_version_number = current_version + 1
         
         logger.info(f"Versión actual: {current_version}, nueva versión: {new_version_number}")
         
         log_document_processing_end(
-            get_version_registro_id, 
+            version_query_id,
             estado='completado',
-            datos_procesados={"current_version": current_version, "new_version": new_version_number}
+            datos_procesados={
+                "current_version": current_version,
+                "new_version": new_version_number
+            }
         )
         
-        # Generar ID único para la nueva versión
+        # 5. Generar IDs únicos para la nueva versión y análisis
         version_id = generate_uuid()
+        analysis_id = generate_uuid()
         
-        # Preparar datos para la nueva versión
-        insert_version_registro_id = log_document_processing_start(
-            document_id, 
-            'insertar_nueva_version',
-            datos_entrada={"version_id": version_id, "version_number": new_version_number},
+        # 6. Crear registro de nueva versión
+        create_version_id = log_document_processing_start(
+            document_id,
+            'crear_nueva_version',
+            datos_entrada={
+                "version_id": version_id,
+                "new_version_number": new_version_number
+            },
             analisis_id=version_registro_id
         )
         
@@ -970,7 +1083,7 @@ def process_new_document_version(document_id, file_metadata, dest_bucket, dest_k
             'numero_version': new_version_number,
             'fecha_creacion': datetime.now().isoformat(),
             'creado_por': existing_document.get('modificado_por', '691d8c44-f524-48fd-b292-be9e31977711'),
-            'comentario_version': f'Nueva versión {new_version_number}',
+            'comentario_version': f'Nueva versión {new_version_number} - {file_metadata["filename"]}',
             'tamano_bytes': file_metadata['size'],
             'hash_contenido': file_metadata['hash'],
             'ubicacion_almacenamiento_tipo': 's3',
@@ -983,23 +1096,49 @@ def process_new_document_version(document_id, file_metadata, dest_bucket, dest_k
             'miniaturas_generadas': False
         }
         
-        # Insertar nueva versión en la base de datos
-        insert_document_version(version_data)
+        # Insertar nueva versión
+        try:
+            insert_document_version(version_data)
+            logger.info(f"Nueva versión {new_version_number} creada con ID {version_id}")
+            
+            log_document_processing_end(
+                create_version_id,
+                estado='completado',
+                datos_procesados={
+                    "version_id": version_id,
+                    "version_number": new_version_number
+                }
+            )
+            
+        except Exception as version_error:
+            logger.error(f"Error al crear nueva versión: {str(version_error)}")
+            
+            log_document_processing_end(
+                create_version_id,
+                estado='error',
+                mensaje_error=str(version_error)
+            )
+            
+            log_document_processing_end(
+                version_registro_id,
+                estado='error',
+                mensaje_error=f"Error creando versión: {str(version_error)}"
+            )
+            
+            return False
         
-        log_document_processing_end(
-            insert_version_registro_id, 
-            estado='completado',
-            datos_procesados={"version_id": version_id}
-        )
-        
-        # Actualizar el documento con la nueva versión actual
-        update_doc_registro_id = log_document_processing_start(
-            document_id, 
+        # 7. Actualizar documento para apuntar a nueva versión
+        update_doc_id = log_document_processing_start(
+            document_id,
             'actualizar_documento_version',
-            datos_entrada={"new_version": new_version_number},
+            datos_entrada={
+                "new_version": new_version_number,
+                "version_id": version_id
+            },
             analisis_id=version_registro_id
         )
         
+        # IMPORTANTE: NO actualizar datos_extraidos_ia aquí, se hará después del procesamiento
         update_query = """
         UPDATE documentos
         SET version_actual = %s,
@@ -1009,96 +1148,165 @@ def process_new_document_version(document_id, file_metadata, dest_bucket, dest_k
         WHERE id_documento = %s
         """
         
-        execute_query(
-            update_query, 
-            (
-                new_version_number, 
-                datetime.now().isoformat(), 
-                existing_document.get('modificado_por', '691d8c44-f524-48fd-b292-be9e31977711'), 
-                document_id
-            ), 
-            fetch=False
-        )
+        try:
+            execute_query(
+                update_query, 
+                (
+                    new_version_number, 
+                    datetime.now().isoformat(), 
+                    existing_document.get('modificado_por', '691d8c44-f524-48fd-b292-be9e31977711'), 
+                    document_id
+                ), 
+                fetch=False
+            )
+            
+            log_document_processing_end(
+                update_doc_id,
+                estado='completado',
+                datos_procesados={"version_updated": True}
+            )
+            
+        except Exception as update_error:
+            logger.error(f"Error al actualizar documento: {str(update_error)}")
+            
+            log_document_processing_end(
+                update_doc_id,
+                estado='error',
+                mensaje_error=str(update_error)
+            )
+            
+            # No es crítico, continuar
         
-        log_document_processing_end(
-            update_doc_registro_id, 
-            estado='completado'
-        )
-        
-        # Registrar en auditoría
-        audit_registro_id = log_document_processing_start(
-            document_id, 
-            'insertar_auditoria',
-            datos_entrada={"action": "nueva_version"},
+        # 8. Crear nuevo registro de análisis para la nueva versión
+        create_analysis_id = log_document_processing_start(
+            document_id,
+            'crear_analisis_nueva_version',
+            datos_entrada={
+                "analysis_id": analysis_id,
+                "version_id": version_id
+            },
             analisis_id=version_registro_id
         )
         
-        audit_data = {
-            'fecha_hora': datetime.now().isoformat(),
-            'usuario_id': existing_document.get('modificado_por', '691d8c44-f524-48fd-b292-be9e31977711'),
-            'direccion_ip': '0.0.0.0',
-            'accion': 'nueva_version',
-            'entidad_afectada': 'documento',
-            'id_entidad_afectada': document_id,
-            'detalles': json.dumps({
-                'version_anterior': current_version,
-                'nueva_version': new_version_number,
-                'filename': file_metadata['filename']
+        analysis_data = {
+            'id_analisis': analysis_id,
+            'id_documento': document_id,
+            'id_version': version_id,  # ✅ Asociar con la nueva versión
+            'tipo_documento': existing_document.get('nombre_tipo', 'documento'),
+            'estado_analisis': 'iniciado',
+            'fecha_analisis': datetime.now().isoformat(),
+            'confianza_clasificacion': 0.5,
+            'texto_extraido': None,
+            'entidades_detectadas': None,
+            'metadatos_extraccion': json.dumps({
+                'version': new_version_number,
+                'version_id': version_id,
+                'filename': file_metadata['filename'],
+                'created_for': 'nueva_version'
             }),
-            'resultado': 'éxito'
+            'mensaje_error': None,
+            'version_modelo': 'nueva-version',
+            'tiempo_procesamiento': 0,
+            'procesado_por': 'upload_processor',
+            'requiere_verificacion': True,
+            'verificado': False,
+            'verificado_por': None,
+            'fecha_verificacion': None
         }
         
-        insert_audit_record(audit_data)
+        try:
+            insert_analysis_record(analysis_data)
+            logger.info(f"Análisis creado para nueva versión: {analysis_id}")
+            
+            log_document_processing_end(
+                create_analysis_id,
+                estado='completado',
+                datos_procesados={
+                    "analysis_id": analysis_id,
+                    "linked_to_version": version_id
+                }
+            )
+            
+        except Exception as analysis_error:
+            logger.error(f"Error al crear análisis: {str(analysis_error)}")
+            
+            log_document_processing_end(
+                create_analysis_id,
+                estado='error',
+                mensaje_error=str(analysis_error)
+            )
+            
+            # Continuar sin análisis por ahora
         
-        log_document_processing_end(
-            audit_registro_id, 
-            estado='completado'
-        )
-        
-        # Procesar el contenido de la nueva versión
-        classification_registro_id = log_document_processing_start(
-            document_id, 
-            'clasificacion_nueva_version',
-            datos_entrada={"filename": file_metadata['filename']},
+        # 9. Registrar en auditoría
+        audit_id = log_document_processing_start(
+            document_id,
+            'registrar_auditoria',
+            datos_entrada={"new_version": new_version_number},
             analisis_id=version_registro_id
         )
         
+        try:
+            audit_data = {
+                'fecha_hora': datetime.now().isoformat(),
+                'usuario_id': existing_document.get('modificado_por', '691d8c44-f524-48fd-b292-be9e31977711'),
+                'direccion_ip': '0.0.0.0',
+                'accion': 'nueva_version',
+                'entidad_afectada': 'documento',
+                'id_entidad_afectada': document_id,
+                'detalles': json.dumps({
+                    'version_anterior': current_version,
+                    'nueva_version': new_version_number,
+                    'version_id': version_id,
+                    'analysis_id': analysis_id,
+                    'filename': file_metadata['filename'],
+                    'datos_preservados': bool(existing_document.get('datos_extraidos_ia'))
+                }),
+                'resultado': 'éxito'
+            }
+            
+            insert_audit_record(audit_data)
+            
+            log_document_processing_end(
+                audit_id,
+                estado='completado'
+            )
+            
+        except Exception as audit_error:
+            logger.warning(f"Error en auditoría: {str(audit_error)}")
+            
+            log_document_processing_end(
+                audit_id,
+                estado='error',
+                mensaje_error=str(audit_error)
+            )
+        
+        # 10. Procesar el contenido de la nueva versión
+        process_content_id = log_document_processing_start(
+            document_id,
+            'procesar_contenido_nueva_version',
+            datos_entrada={
+                "version_id": version_id,
+                "analysis_id": analysis_id
+            },
+            analisis_id=version_registro_id
+        )
+        
+        # Determinar clasificación preliminar
         preliminary_classification = determine_document_type_from_metadata(file_metadata, file_metadata['filename'])
         
-        log_document_processing_end(
-            classification_registro_id, 
-            estado='completado',
-            datos_procesados={"doc_type": preliminary_classification.get('doc_type')}
-        )
-        
         # Decidir entre Textract o PyPDF2
-        decision_registro_id = log_document_processing_start(
-            document_id, 
-            'decidir_procesamiento_version',
-            datos_entrada={"extension": file_metadata['extension']},
-            analisis_id=version_registro_id
-        )
-        
         needs_textract = should_use_textract(
             file_metadata, 
             {'nombre_tipo': existing_document.get('nombre_tipo')}, 
             preliminary_classification
         )
         
-        log_document_processing_end(
-            decision_registro_id, 
-            estado='completado',
-            datos_procesados={"needs_textract": needs_textract}
-        )
+        processing_success = False
         
         if needs_textract:
             # Procesar con Textract
-            textract_registro_id = log_document_processing_start(
-                document_id, 
-                'iniciar_textract_version',
-                datos_entrada={"doc_type": preliminary_classification.get('doc_type')},
-                analisis_id=version_registro_id
-            )
+            logger.info(f"Procesando nueva versión {new_version_number} con Textract")
             
             textract_result = start_textract_processing(
                 document_id, 
@@ -1108,20 +1316,11 @@ def process_new_document_version(document_id, file_metadata, dest_bucket, dest_k
                 preliminary_classification
             )
             
-            log_document_processing_end(
-                textract_registro_id, 
-                estado='completado',
-                datos_procesados={"result": textract_result}
-            )
+            processing_success = textract_result
             
         else:
             # Intentar procesamiento local
-            pypdf_registro_id = log_document_processing_start(
-                document_id, 
-                'iniciar_pypdf2_version',
-                datos_entrada={"filename": file_metadata['filename']},
-                analisis_id=version_registro_id
-            )
+            logger.info(f"Procesando nueva versión {new_version_number} con PyPDF2")
             
             success = process_with_pypdf2(
                 document_id, 
@@ -1131,20 +1330,9 @@ def process_new_document_version(document_id, file_metadata, dest_bucket, dest_k
                 file_metadata
             )
             
-            log_document_processing_end(
-                pypdf_registro_id, 
-                estado='completado',
-                datos_procesados={"success": success}
-            )
-            
             if not success:
                 # Si falla el procesamiento local, usar Textract
-                fallback_registro_id = log_document_processing_start(
-                    document_id, 
-                    'textract_fallback_version',
-                    datos_entrada={"reason": "pypdf2_failed"},
-                    analisis_id=version_registro_id
-                )
+                logger.info(f"PyPDF2 falló, usando Textract como fallback")
                 
                 textract_result = start_textract_processing(
                     document_id, 
@@ -1154,17 +1342,33 @@ def process_new_document_version(document_id, file_metadata, dest_bucket, dest_k
                     preliminary_classification
                 )
                 
-                log_document_processing_end(
-                    fallback_registro_id, 
-                    estado='completado',
-                    datos_procesados={"result": textract_result}
-                )
+                processing_success = textract_result
+            else:
+                processing_success = True
         
         log_document_processing_end(
-            version_registro_id, 
-            estado='completado'
+            process_content_id,
+            estado='completado' if processing_success else 'advertencia',
+            datos_procesados={
+                "processing_method": "textract" if needs_textract else "pypdf2",
+                "success": processing_success
+            }
         )
         
+        # Finalizar procesamiento exitoso
+        log_document_processing_end(
+            version_registro_id, 
+            estado='completado',
+            datos_procesados={
+                'nueva_version': new_version_number,
+                'version_id': version_id,
+                'analysis_id': analysis_id,
+                'datos_preservados': bool(existing_document.get('datos_extraidos_ia')),
+                'processing_started': processing_success
+            }
+        )
+        
+        logger.info(f"Nueva versión {new_version_number} procesada exitosamente para documento {document_id}")
         return True
     
     except Exception as e:
@@ -1177,7 +1381,7 @@ def process_new_document_version(document_id, file_metadata, dest_bucket, dest_k
         )
         
         # En caso de error, intentar procesar como documento nuevo
-        logger.info(f"Intentando procesar como documento nuevo")
+        logger.info(f"Intentando procesar como documento nuevo debido a error")
         return process_new_document(document_id, file_metadata, dest_bucket, dest_key, client_id)
 
 def lambda_handler(event, context):
