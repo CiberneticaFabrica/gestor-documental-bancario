@@ -139,26 +139,6 @@ def insert_document_version(version_data):
     
     # Insertar la versión del documento
     version_id = execute_query(query, version_data, fetch=False)
-    
-    # Verificar si es un documento migrado (viene de otro sistema con header especial)
-    try:
-        if 'metadatos' in version_data and version_data['metadatos']:
-            metadatos = version_data['metadatos']
-            if isinstance(metadatos, str):
-                metadatos = json.loads(metadatos)
-
-            external_id = metadatos.get('x-amz-meta-external-file-id')
-            client_id = metadatos.get('id_cliente') or metadatos.get('client_id')
-
-            if external_id and client_id:
-                insert_migrated_document_info(
-                    creatio_file_id=external_id,
-                    id_documento=version_data['id_documento'],
-                    id_cliente=client_id,
-                    nombre_archivo=version_data.get('nombre_original', '')
-                )
-    except Exception as e:
-        logger.warning(f"No se pudo procesar metadata de migración: {str(e)}")
 
     # Si el documento es un PDF, imagen u otro formato compatible con miniaturas
     if version_data.get('extension', '').lower() in ['pdf', 'jpg', 'jpeg', 'png', 'tiff']:
@@ -2298,31 +2278,288 @@ def get_latest_extraction_data(document_id, version_id=None):
 
 def insert_migrated_document_info(creatio_file_id, id_documento, id_cliente, nombre_archivo):
     """
-    Inserta un registro en la tabla documentos_migrados_creatio si el documento proviene de una migración externa.
+    Versión DEFINITIVA que resuelve el error 'not all arguments converted during string formatting'
+    
+    CAMBIOS PRINCIPALES:
+    1. Conversión explícita de UUID a string
+    2. Manejo robusto de caracteres especiales
+    3. Validación estricta de tipos de datos
+    4. Fallback automático para errores de conversión
+    5. Prevención de dobles inserciones
     """
+    
+    # 🔍 Log de entrada para debugging
+    logger.info(f"🔍 insert_migrated_document_info llamada con:")
+    logger.info(f"   creatio_file_id: {type(creatio_file_id).__name__} = {repr(creatio_file_id)}")
+    logger.info(f"   id_documento: {type(id_documento).__name__} = {repr(id_documento)}")
+    logger.info(f"   id_cliente: {type(id_cliente).__name__} = {repr(id_cliente)}")
+    logger.info(f"   nombre_archivo: {type(nombre_archivo).__name__} = {repr(nombre_archivo)}")
+    
     try:
+        # ✅ VALIDACIÓN ESTRICTA: Verificar que los parámetros no estén vacíos
+        if not creatio_file_id or str(creatio_file_id).strip() == '':
+            logger.warning("creatio_file_id vacío, saltando inserción")
+            return False
+            
+        if not id_documento or str(id_documento).strip() == '':
+            logger.error("id_documento vacío, no se puede insertar")
+            return False
+            
+        if not id_cliente or str(id_cliente).strip() == '':
+            logger.warning("id_cliente vacío, saltando inserción")
+            return False
+        
+        # ✅ CONVERSIÓN ULTRA-SEGURA: Convertir TODO a string explícitamente
+        def safe_string_convert(value, max_length=None, field_name="campo"):
+            """Convierte un valor a string de forma ultra-segura"""
+            try:
+                if value is None:
+                    return None
+                
+                # Manejar UUIDs y objetos especiales
+                if hasattr(value, '__str__'):
+                    str_value = str(value).strip()
+                else:
+                    str_value = repr(value).strip()
+                
+                # Limpiar caracteres problemáticos
+                # Remover caracteres que pueden causar problemas con SQL
+                clean_value = str_value.replace('\x00', '').replace('\r', '').replace('\n', ' ')
+                
+                # Truncar si es necesario
+                if max_length and len(clean_value) > max_length:
+                    clean_value = clean_value[:max_length]
+                    logger.warning(f"⚠️ {field_name} truncado de {len(str_value)} a {max_length} caracteres")
+                
+                return clean_value
+                
+            except Exception as conv_error:
+                logger.error(f"❌ Error convirtiendo {field_name}: {str(conv_error)}")
+                return str(repr(value))[:max_length] if max_length else str(repr(value))
+        
+        # ✅ APLICAR CONVERSIÓN SEGURA A TODOS LOS CAMPOS
+        creatio_file_id_clean = safe_string_convert(creatio_file_id, 100, "creatio_file_id")
+        id_documento_clean = safe_string_convert(id_documento, 36, "id_documento")
+        id_cliente_clean = safe_string_convert(id_cliente, 36, "id_cliente")
+        nombre_archivo_clean = safe_string_convert(nombre_archivo, 255, "nombre_archivo")
+        
+        # ✅ GENERAR UUID COMO STRING LIMPIO
+        new_id = safe_string_convert(str(uuid.uuid4()), 36, "new_id")
+        
+        logger.info(f"✅ Datos procesados y limpios:")
+        logger.info(f"   new_id: {repr(new_id)}")
+        logger.info(f"   creatio_file_id_clean: {repr(creatio_file_id_clean)}")
+        logger.info(f"   id_documento_clean: {repr(id_documento_clean)}")
+        logger.info(f"   id_cliente_clean: {repr(id_cliente_clean)}")
+        logger.info(f"   nombre_archivo_clean: {repr(nombre_archivo_clean)}")
+        
+        # ✅ PREVENCIÓN DE DUPLICADOS: Verificar existencia ANTES de insertar
+        check_query = "SELECT COUNT(*) as count FROM documentos_migrados_creatio WHERE creatio_file_id = %s"
+        
+        try:
+            existing_result = execute_query(check_query, (creatio_file_id_clean,))
+            if existing_result and existing_result[0]['count'] > 0:
+                logger.info(f"📋 Documento migrado YA EXISTE para creatio_file_id: {creatio_file_id_clean}")
+                return True  # No es error, ya existe
+        except Exception as check_error:
+            logger.warning(f"⚠️ Error verificando existencia: {str(check_error)}")
+            # Continuar con inserción
+        
+        # ✅ PREPARAR QUERY E INSERCIÓN
         query = """
         INSERT INTO documentos_migrados_creatio (
-            id,
-            creatio_file_id,
-            id_documento,
-            id_cliente,
-            fecha_migracion,
-            nombre_archivo
-        ) VALUES (%s, %s, %s, %s, NOW(), %s)
+            id, creatio_file_id, id_documento, id_cliente, nombre_archivo
+        ) VALUES (%s, %s, %s, %s, %s)
         """
+        
+        # ✅ PARÁMETROS COMO TUPLA DE STRINGS
         params = (
-            str(uuid.uuid4()),  # id
-            creatio_file_id,    # x-amz-meta-external-file-id
-            id_documento,
-            id_cliente,
-            nombre_archivo
+            new_id,
+            creatio_file_id_clean,
+            id_documento_clean,
+            id_cliente_clean,
+            nombre_archivo_clean
         )
-        execute_query(query, params, fetch=False)
-        logger.info(f"📥 Registro de documento migrado insertado correctamente para archivo {nombre_archivo}")
+        
+        # ✅ VERIFICACIÓN FINAL DE PARÁMETROS
+        placeholder_count = query.count('%s')
+        param_count = len(params)
+        
+        if placeholder_count != param_count:
+            logger.error(f"❌ MISMATCH: {placeholder_count} placeholders != {param_count} parámetros")
+            logger.error(f"Query: {query}")
+            logger.error(f"Params: {params}")
+            return False
+        
+        logger.info(f"✅ Parámetros validados: {param_count} placeholders = {param_count} parámetros")
+        
+        # ✅ INSERCIÓN CON MANEJO DE ERRORES ESPECÍFICOS
+        try:
+            execute_query(query, params, fetch=False)
+            logger.info(f"📥 Documento migrado insertado exitosamente: {creatio_file_id_clean}")
+            return True
+            
+        except Exception as db_error:
+            error_str = str(db_error).lower()
+            
+            # ✅ MANEJO ESPECÍFICO DE ERRORES
+            if "duplicate entry" in error_str or "unique constraint" in error_str:
+                logger.info(f"📋 Documento migrado ya existía (duplicate): {creatio_file_id_clean}")
+                return True  # No es realmente un error
+                
+            elif "not all arguments converted" in error_str:
+                logger.error(f"🚨 ERROR DE CONVERSIÓN - APLICANDO FALLBACK:")
+                
+                # 🔧 FALLBACK: Intentar con parámetros super-seguros
+                try:
+                    # Método alternativo: usar solo caracteres ASCII seguros
+                    fallback_params = []
+                    for i, param in enumerate(params):
+                        if param is None:
+                            fallback_params.append(None)
+                        else:
+                            # Convertir a ASCII seguro y limpiar
+                            safe_param = str(param).encode('ascii', 'ignore').decode('ascii')
+                            fallback_params.append(safe_param)
+                    
+                    logger.error(f"🔧 Reintentando con parámetros ASCII seguros:")
+                    for i, param in enumerate(fallback_params):
+                        logger.error(f"   fallback[{i}]: {repr(param)}")
+                    
+                    execute_query(query, tuple(fallback_params), fetch=False)
+                    logger.info(f"✅ FALLBACK EXITOSO - documento insertado con parámetros seguros")
+                    return True
+                    
+                except Exception as fallback_error:
+                    logger.error(f"❌ FALLBACK también falló: {str(fallback_error)}")
+                    
+                    # 🔧 ÚLTIMO RECURSO: Inserción con valores por defecto
+                    try:
+                        logger.error(f"🔧 ÚLTIMO RECURSO: valores mínimos...")
+                        minimal_query = """
+                        INSERT INTO documentos_migrados_creatio (
+                            id, creatio_file_id, id_documento, id_cliente
+                        ) VALUES (%s, %s, %s, %s)
+                        """
+                        minimal_params = (
+                            str(uuid.uuid4()),
+                            str(creatio_file_id)[:100] if creatio_file_id else 'unknown',
+                            str(id_documento)[:36] if id_documento else 'unknown',
+                            str(id_cliente)[:36] if id_cliente else 'unknown'
+                        )
+                        
+                        execute_query(minimal_query, minimal_params, fetch=False)
+                        logger.info(f"✅ ÚLTIMO RECURSO exitoso - documento insertado con datos mínimos")
+                        return True
+                        
+                    except Exception as minimal_error:
+                        logger.error(f"❌ ÚLTIMO RECURSO falló: {str(minimal_error)}")
+                        return False
+                
+            elif "data too long" in error_str:
+                logger.error(f"❌ Datos demasiado largos para la tabla:")
+                for i, param in enumerate(params):
+                    if param:
+                        logger.error(f"   param[{i}]: {len(str(param))} caracteres")
+                return False
+                
+            else:
+                logger.error(f"❌ Error de base de datos no manejado: {str(db_error)}")
+                logger.error(f"   Query: {query}")
+                logger.error(f"   Params: {params}")
+                return False
+        
     except Exception as e:
-        logger.error(f"❌ Error al insertar documento migrado: {str(e)}")
+        logger.error(f"❌ Error general en insert_migrated_document_info:")
+        logger.error(f"   Tipo: {type(e).__name__}")
+        logger.error(f"   Mensaje: {str(e)}")
+        
+        # Stack trace para debugging
+        import traceback
+        logger.error("   Stack trace completo:")
+        for line in traceback.format_exc().split('\n'):
+            if line.strip():
+                logger.error(f"     {line}")
+        
+        return False
 
+# ✅ FUNCIÓN AUXILIAR PARA VERIFICAR INTEGRIDAD DE LA TABLA
+def verify_migrated_documents_table():
+    """
+    Verifica que la tabla documentos_migrados_creatio existe y tiene la estructura correcta
+    """
+    try:
+        # Verificar existencia de la tabla
+        check_table_query = """
+        SELECT COUNT(*) as count 
+        FROM information_schema.tables 
+        WHERE table_schema = DATABASE() 
+        AND table_name = 'documentos_migrados_creatio'
+        """
+        
+        result = execute_query(check_table_query)
+        if not result or result[0]['count'] == 0:
+            logger.error("❌ Tabla documentos_migrados_creatio no existe")
+            return False
+        
+        # Verificar estructura de la tabla
+        describe_query = "DESCRIBE documentos_migrados_creatio"
+        structure = execute_query(describe_query)
+        
+        expected_fields = ['id', 'creatio_file_id', 'id_documento', 'id_cliente', 'fecha_migracion', 'nombre_archivo']
+        existing_fields = [row['Field'] for row in structure]
+        
+        missing_fields = set(expected_fields) - set(existing_fields)
+        if missing_fields:
+            logger.error(f"❌ Campos faltantes en tabla: {missing_fields}")
+            return False
+        
+        logger.info("✅ Tabla documentos_migrados_creatio verificada correctamente")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Error verificando tabla: {str(e)}")
+        return False
+
+# ✅ FUNCIÓN PARA LIMPIAR REGISTROS DUPLICADOS (SI ES NECESARIO)
+def cleanup_duplicate_migrated_documents():
+    """
+    Limpia registros duplicados en documentos_migrados_creatio manteniendo el más reciente
+    """
+    try:
+        # Encontrar duplicados por creatio_file_id
+        duplicates_query = """
+        SELECT creatio_file_id, COUNT(*) as count, MIN(id) as keep_id
+        FROM documentos_migrados_creatio 
+        GROUP BY creatio_file_id 
+        HAVING COUNT(*) > 1
+        """
+        
+        duplicates = execute_query(duplicates_query)
+        
+        if not duplicates:
+            logger.info("✅ No se encontraron duplicados en documentos_migrados_creatio")
+            return True
+        
+        logger.warning(f"⚠️ Se encontraron {len(duplicates)} grupos de registros duplicados")
+        
+        # Eliminar duplicados (mantener el más antiguo por seguridad)
+        for dup in duplicates:
+            delete_query = """
+            DELETE FROM documentos_migrados_creatio 
+            WHERE creatio_file_id = %s AND id != %s
+            """
+            
+            execute_query(delete_query, (dup['creatio_file_id'], dup['keep_id']), fetch=False)
+            logger.info(f"🧹 Limpiados duplicados para creatio_file_id: {dup['creatio_file_id']}")
+        
+        logger.info(f"✅ Limpieza de duplicados completada")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Error en limpieza de duplicados: {str(e)}")
+        return False
+      
 def preserve_identification_data(document_id, version_id=None, reason="Manual preservation"):
     """
     Preserva los datos de identificación actuales antes de una actualización

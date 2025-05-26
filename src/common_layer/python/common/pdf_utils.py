@@ -6,6 +6,8 @@ import json
 import io
 import time
 import tempfile
+import re
+from datetime import datetime
 from urllib.parse import unquote_plus
 from concurrent.futures import ThreadPoolExecutor
 
@@ -21,7 +23,7 @@ except ImportError:
 logger = logging.getLogger()
 logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
 
-# Configuración de clientes con reintentos - CORREGIDO: Importando Config correctamente
+# Configuración de clientes con reintentos
 from botocore.config import Config
 retry_config = Config(
     retries={
@@ -45,7 +47,6 @@ def operation_with_retry(operation_func, max_retries=3, base_delay=0.5, **kwargs
             logger.warning(f"Reintento {attempt+1}/{max_retries} después de error: {str(e)}. Esperando {delay:.2f}s")
             time.sleep(delay)
     
-    # Si llegamos aquí, todos los reintentos fallaron
     logger.error(f"Operación falló después de {max_retries} intentos. Último error: {str(last_exception)}")
     raise last_exception
 
@@ -110,6 +111,502 @@ def extract_text_with_pypdf2(bucket, key):
     except Exception as e:
         logger.error(f"Error general en extract_text_with_pypdf2: {str(e)}")
         return f"ERROR: Fallo crítico en procesamiento PyPDF2: {str(e)}"
+
+# ===== NUEVAS FUNCIONES PARA PROCESAMIENTO COMPLETO =====
+
+def extract_structured_patterns_pypdf2(text):
+    """
+    🆕 Extrae patrones estructurados del texto usando PyPDF2 (similar a Textract)
+    """
+    try:
+        patterns = {
+            'dni': r'\b\d{8}[A-Za-z]?\b',
+            'passport': r'\b[A-Z]{1,2}[0-9]{6,7}\b',
+            'email': r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b',
+            'phone': r'\b(?:\+\d{1,3}\s?)?\(?\d{1,4}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b',
+            'iban': r'\b[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}([A-Z0-9]?){0,16}\b',
+            'dates': r'\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b',
+            'amounts': r'\b\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?\s*(?:€|EUR|USD|\$)?\b',
+            'percentages': r'\b\d{1,2}(?:[.,]\d{1,2})?\s*%\b',
+            'contract_numbers': r'\b(?:contrato|contract|ref|referencia)[:\s#]*([A-Z0-9-]+)\b',
+            'nif_cif': r'\b[A-Z]\d{7}[A-Z0-9]\b'
+        }
+        
+        structured_data = {}
+        for entity_type, pattern in patterns.items():
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            if matches:
+                # Limpiar duplicados manteniendo orden
+                unique_matches = list(dict.fromkeys(matches))
+                structured_data[entity_type] = unique_matches[:10]  # Limitar a 10 por tipo
+        
+        logger.debug(f"🔍 Patrones PyPDF2 extraídos: {list(structured_data.keys())}")
+        return structured_data
+        
+    except Exception as e:
+        logger.error(f"Error extrayendo patrones PyPDF2: {str(e)}")
+        return {}
+
+def extract_type_specific_data_pypdf2(text, doc_type):
+    """
+    🆕 Extrae datos específicos según tipo de documento con PyPDF2
+    """
+    try:
+        if doc_type in ['dni', 'pasaporte', 'cedula', 'cedula_panama']:
+            return extract_id_document_data_pypdf2(text, doc_type == 'pasaporte')
+        elif doc_type in ['contrato', 'contrato_cuenta', 'contrato_tarjeta', 'contrato_prestamo']:
+            return extract_contract_data_pypdf2(text)
+        elif doc_type in ['extracto', 'extracto_bancario', 'nomina']:
+            return extract_financial_data_pypdf2(text)
+        else:
+            return extract_generic_data_pypdf2(text)
+            
+    except Exception as e:
+        logger.error(f"Error en extracción específica PyPDF2: {str(e)}")
+        return {}
+
+def extract_id_document_data_pypdf2(text, is_passport=False):
+    """
+    🆕 Extrae datos de documentos de identidad con PyPDF2
+    """
+    try:
+        data = {
+            'tipo_identificacion': 'pasaporte' if is_passport else 'dni',
+            'numero_identificacion': None,
+            'nombre_completo': None,
+            'fecha_nacimiento': None,
+            'fecha_emision': None,
+            'fecha_expiracion': None,
+            'pais_emision': 'España' if not is_passport else None,
+            'genero': None,
+            'lugar_nacimiento': None,
+            'nacionalidad': None
+        }
+        
+        # Buscar número de documento
+        if is_passport:
+            passport_patterns = [
+                r'pasaporte[:\s]*([A-Z]{1,2}[0-9]{6,7})',
+                r'passport[:\s]*([A-Z]{1,2}[0-9]{6,7})',
+                r'\b([A-Z]{1,2}[0-9]{6,7})\b'
+            ]
+            for pattern in passport_patterns:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    data['numero_identificacion'] = match.group(1)
+                    break
+        else:
+            dni_patterns = [
+                r'dni[:\s]*(\d{8}[A-Za-z]?)',
+                r'documento[:\s]*(\d{8}[A-Za-z]?)',
+                r'cédula[:\s]*(\d{8}[A-Za-z]?)',
+                r'\b(\d{8}[A-Za-z]?)\b'
+            ]
+            for pattern in dni_patterns:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    data['numero_identificacion'] = match.group(1)
+                    break
+        
+        # Buscar nombre completo
+        name_patterns = [
+            r'nombre[:\s]+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)*)',
+            r'apellidos[:\s]+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)*)',
+            r'titular[:\s]+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)*)'
+        ]
+        
+        names_found = []
+        for pattern in name_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            names_found.extend(matches)
+        
+        if names_found:
+            # Unir los nombres encontrados
+            full_name = ' '.join(names_found[:3])  # Máximo 3 componentes
+            data['nombre_completo'] = full_name
+        
+        # Buscar fechas
+        date_patterns = re.findall(r'\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b', text)
+        if date_patterns:
+            normalized_dates = []
+            for date_str in date_patterns:
+                normalized = normalize_date_safe(date_str)
+                if normalized:
+                    normalized_dates.append(normalized)
+            
+            if normalized_dates:
+                normalized_dates.sort()
+                # Asignar fechas según contexto
+                if len(normalized_dates) >= 3:
+                    data['fecha_nacimiento'] = normalized_dates[0]  # Más antigua
+                    data['fecha_emision'] = normalized_dates[1]     # Media
+                    data['fecha_expiracion'] = normalized_dates[-1] # Más reciente
+                elif len(normalized_dates) == 2:
+                    data['fecha_emision'] = normalized_dates[0]
+                    data['fecha_expiracion'] = normalized_dates[1]
+                else:
+                    data['fecha_expiracion'] = normalized_dates[0]
+        
+        # Buscar género
+        if re.search(r'\b(masculino|hombre|male|m)\b', text, re.IGNORECASE):
+            data['genero'] = 'M'
+        elif re.search(r'\b(femenino|mujer|female|f)\b', text, re.IGNORECASE):
+            data['genero'] = 'F'
+        
+        # Buscar país de emisión para pasaportes
+        if is_passport:
+            country_patterns = [
+                r'país[:\s]+([A-ZÁÉÍÓÚ][a-záéíóúñ]+)',
+                r'country[:\s]+([A-Z][a-z]+)',
+                r'nacionalidad[:\s]+([A-ZÁÉÍÓÚ][a-záéíóúñ]+)'
+            ]
+            for pattern in country_patterns:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    data['pais_emision'] = match.group(1)
+                    data['nacionalidad'] = match.group(1)
+                    break
+        
+        return data
+        
+    except Exception as e:
+        logger.error(f"Error extrayendo datos de ID PyPDF2: {str(e)}")
+        return {}
+
+def extract_contract_data_pypdf2(text):
+    """
+    🆕 Extrae datos de contratos con PyPDF2
+    """
+    try:
+        data = {
+            'tipo_contrato': 'general',
+            'numero_contrato': None,
+            'fecha_contrato': None,
+            'partes': [],
+            'importe': None,
+            'tasa_interes': None,
+            'plazo': None,
+            'entidad_bancaria': None
+        }
+        
+        # Determinar tipo de contrato
+        text_lower = text.lower()
+        contract_types = {
+            'cuenta': ['cuenta corriente', 'cuenta de ahorro', 'cuenta bancaria'],
+            'tarjeta': ['tarjeta de crédito', 'tarjeta de débito', 'tarjeta bancaria'],
+            'prestamo': ['préstamo', 'crédito', 'hipoteca', 'financiación'],
+            'deposito': ['depósito', 'plazo fijo', 'inversión']
+        }
+        
+        for tipo, keywords in contract_types.items():
+            if any(keyword in text_lower for keyword in keywords):
+                data['tipo_contrato'] = tipo
+                break
+        
+        # Buscar número de contrato
+        contract_patterns = [
+            r'número.*?contrato[:\s]*([A-Z0-9/-]+)',
+            r'contrato.*?número[:\s]*([A-Z0-9/-]+)',
+            r'referencia[:\s]*([A-Z0-9/-]+)',
+            r'nº.*?contrato[:\s]*([A-Z0-9/-]+)'
+        ]
+        
+        for pattern in contract_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                data['numero_contrato'] = match.group(1).strip()
+                break
+        
+        # Buscar entidad bancaria
+        bank_patterns = [
+            r'(banco\s+[a-záéíóúñ]+(?:\s+[a-záéíóúñ]+)*)',
+            r'(caja\s+[a-záéíóúñ]+(?:\s+[a-záéíóúñ]+)*)',
+            r'(bbva|santander|caixabank|bankia|sabadell|unicaja)'
+        ]
+        
+        for pattern in bank_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                data['entidad_bancaria'] = match.group(1).strip()
+                break
+        
+        # Buscar fechas
+        date_matches = re.findall(r'\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b', text)
+        if date_matches:
+            normalized_date = normalize_date_safe(date_matches[0])
+            if normalized_date:
+                data['fecha_contrato'] = normalized_date
+        
+        # Buscar importes
+        amount_patterns = [
+            r'importe[:\s]*(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?\s*€?)',
+            r'cantidad[:\s]*(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?\s*€?)',
+            r'euros?[:\s]*(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)',
+            r'(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?\s*(?:€|euros?))'
+        ]
+        
+        amounts_found = []
+        for pattern in amount_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            amounts_found.extend(matches)
+        
+        if amounts_found:
+            # Tomar el importe más grande como principal
+            max_amount = max(amounts_found, key=lambda x: len(re.sub(r'[^\d]', '', x)))
+            data['importe'] = max_amount
+        
+        # Buscar tasa de interés
+        interest_patterns = [
+            r'interés[:\s]*(\d{1,2}(?:[.,]\d{1,2})?\s*%)',
+            r'tipo[:\s]*(\d{1,2}(?:[.,]\d{1,2})?\s*%)',
+            r'(\d{1,2}(?:[.,]\d{1,2})?\s*%)\s*anual'
+        ]
+        
+        for pattern in interest_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                data['tasa_interes'] = match.group(1)
+                break
+        
+        # Buscar plazo
+        plazo_patterns = [
+            r'plazo[:\s]*(\d+\s*(?:años?|meses?))',
+            r'duración[:\s]*(\d+\s*(?:años?|meses?))',
+            r'vencimiento[:\s]*(\d+\s*(?:años?|meses?))'
+        ]
+        
+        for pattern in plazo_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                data['plazo'] = match.group(1)
+                break
+        
+        # Buscar partes del contrato
+        party_patterns = [
+            r'titular[:\s]+([A-ZÁÉÍÓÚÑ][a-záéíóúñ\s]+)',
+            r'cliente[:\s]+([A-ZÁÉÍÓÚÑ][a-záéíóúñ\s]+)',
+            r'contratante[:\s]+([A-ZÁÉÍÓÚÑ][a-záéíóúñ\s]+)'
+        ]
+        
+        for pattern in party_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            data['partes'].extend(matches[:2])  # Máximo 2 partes
+        
+        return data
+        
+    except Exception as e:
+        logger.error(f"Error extrayendo datos de contrato PyPDF2: {str(e)}")
+        return {}
+
+def extract_financial_data_pypdf2(text):
+    """
+    🆕 Extrae datos de documentos financieros con PyPDF2
+    """
+    try:
+        data = {
+            'tipo_documento': 'financiero',
+            'periodo': None,
+            'saldo_inicial': None,
+            'saldo_final': None,
+            'ingresos_total': None,
+            'gastos_total': None,
+            'numero_cuenta': None,
+            'entidad': None
+        }
+        
+        # Buscar número de cuenta
+        account_patterns = [
+            r'cuenta[:\s]*([A-Z]{2}\d{2}\s?\d{4}\s?\d{4}\s?\d{2}\s?\d{10})',  # IBAN
+            r'cuenta[:\s]*(\d{4}\s?\d{4}\s?\d{2}\s?\d{10})',  # Cuenta nacional
+            r'nº.*?cuenta[:\s]*(\d{10,20})'
+        ]
+        
+        for pattern in account_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                data['numero_cuenta'] = match.group(1).strip()
+                break
+        
+        # Buscar saldos
+        balance_patterns = [
+            r'saldo.*?inicial[:\s]*(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?\s*€?)',
+            r'saldo.*?final[:\s]*(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?\s*€?)',
+            r'saldo.*?actual[:\s]*(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?\s*€?)'
+        ]
+        
+        balances = re.findall(r'saldo[:\s]*(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?\s*€?)', text, re.IGNORECASE)
+        if balances:
+            if len(balances) >= 2:
+                data['saldo_inicial'] = balances[0]
+                data['saldo_final'] = balances[-1]
+            else:
+                data['saldo_final'] = balances[0]
+        
+        # Buscar período
+        period_patterns = [
+            r'desde[:\s]*(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}).*?hasta[:\s]*(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4})',
+            r'período[:\s]*(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4})',
+            r'mes.*?(\d{1,2}[/.-]\d{2,4})'
+        ]
+        
+        for pattern in period_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                if len(match.groups()) > 1:
+                    data['periodo'] = f"{match.group(1)} - {match.group(2)}"
+                else:
+                    data['periodo'] = match.group(1)
+                break
+        
+        return data
+        
+    except Exception as e:
+        logger.error(f"Error extrayendo datos financieros PyPDF2: {str(e)}")
+        return {}
+
+def extract_generic_data_pypdf2(text):
+    """
+    🆕 Extrae datos genéricos para documentos no clasificados
+    """
+    try:
+        # Análisis básico del contenido
+        word_count = len(text.split())
+        line_count = text.count('\n') + 1
+        
+        # Detectar idioma aproximado
+        spanish_indicators = ['que', 'con', 'por', 'para', 'desde', 'hasta', 'sobre']
+        english_indicators = ['the', 'and', 'for', 'with', 'from', 'this', 'that']
+        
+        spanish_count = sum(1 for word in spanish_indicators if word in text.lower())
+        english_count = sum(1 for word in english_indicators if word in text.lower())
+        
+        likely_language = 'spanish' if spanish_count > english_count else 'english'
+        
+        return {
+            'tipo_contenido': 'documento_generico_pypdf2',
+            'longitud_texto': len(text),
+            'palabras_total': word_count,
+            'lineas_total': line_count,
+            'idioma_probable': likely_language,
+            'texto_resumen': text[:500] if text else '',
+            'contiene_numeros': bool(re.search(r'\d+', text)),
+            'contiene_fechas': bool(re.search(r'\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}', text)),
+            'contiene_emails': bool(re.search(r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b', text))
+        }
+        
+    except Exception as e:
+        logger.error(f"Error en extracción genérica PyPDF2: {str(e)}")
+        return {}
+
+def calculate_pypdf2_confidence(text, doc_type_info, structured_data):
+    """
+    🆕 Calcula confianza para extracción PyPDF2
+    """
+    try:
+        confidence_factors = []
+        
+        # Factor 1: Confianza de clasificación del documento
+        if doc_type_info and 'confidence' in doc_type_info:
+            confidence_factors.append(doc_type_info['confidence'])
+        
+        # Factor 2: Longitud y calidad del texto
+        text_length = len(text)
+        if text_length > 3000:
+            confidence_factors.append(0.85)
+        elif text_length > 2000:
+            confidence_factors.append(0.75)
+        elif text_length > 1000:
+            confidence_factors.append(0.65)
+        elif text_length > 500:
+            confidence_factors.append(0.55)
+        else:
+            confidence_factors.append(0.35)
+        
+        # Factor 3: Entidades estructuradas encontradas
+        total_entities = sum(len(entities) for entities in structured_data.values())
+        if total_entities > 8:
+            confidence_factors.append(0.85)
+        elif total_entities > 5:
+            confidence_factors.append(0.75)
+        elif total_entities > 3:
+            confidence_factors.append(0.65)
+        elif total_entities > 0:
+            confidence_factors.append(0.55)
+        else:
+            confidence_factors.append(0.35)
+        
+        # Factor 4: Presencia de patrones específicos importantes
+        important_patterns = ['dni', 'dates', 'amounts', 'contract_numbers']
+        important_found = sum(1 for pattern in important_patterns if pattern in structured_data)
+        
+        if important_found >= 3:
+            confidence_factors.append(0.80)
+        elif important_found >= 2:
+            confidence_factors.append(0.70)
+        elif important_found >= 1:
+            confidence_factors.append(0.60)
+        else:
+            confidence_factors.append(0.40)
+        
+        # Factor 5: Coherencia del texto (no fragmentado)
+        line_count = text.count('\n')
+        avg_line_length = len(text) / max(line_count, 1)
+        
+        if avg_line_length > 50:  # Líneas largas = mejor extracción
+            confidence_factors.append(0.75)
+        elif avg_line_length > 30:
+            confidence_factors.append(0.65)
+        else:
+            confidence_factors.append(0.45)
+        
+        # Calcular promedio ponderado
+        if confidence_factors:
+            final_confidence = sum(confidence_factors) / len(confidence_factors)
+        else:
+            final_confidence = 0.5
+        
+        # Aplicar factor de reducción por ser PyPDF2 (menos sofisticado que Textract)
+        final_confidence *= 0.90  # Reducir 10%
+        
+        # Limitar rango
+        final_confidence = max(0.15, min(0.90, final_confidence))
+        
+        logger.debug(f"🔢 Confianza PyPDF2 calculada: {final_confidence:.3f} (factores: {len(confidence_factors)})")
+        
+        return final_confidence
+        
+    except Exception as e:
+        logger.error(f"Error calculando confianza PyPDF2: {str(e)}")
+        return 0.5
+
+def normalize_date_safe(date_str):
+    """
+    🆕 Normalización segura de fechas (ya existía pero la mejoramos)
+    """
+    try:
+        if not date_str or not isinstance(date_str, str):
+            return None
+        
+        # Limpiar la cadena
+        clean_date = re.sub(r'[^\d/.-]', '', date_str.strip())
+        
+        if re.match(r'\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}', clean_date):
+            parts = re.split(r'[/.-]', clean_date)
+            if len(parts) == 3:
+                day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
+                
+                # Normalizar año
+                if year < 100:
+                    year += 2000 if year < 50 else 1900
+                
+                # Validar rangos
+                if 1 <= day <= 31 and 1 <= month <= 12 and 1900 <= year <= 2100:
+                    return f"{year:04d}-{month:02d}-{day:02d}"
+        
+        return None
+        
+    except Exception:
+        return None
 
 def extract_text_from_pdf_with_textract(bucket, key):
     """

@@ -25,7 +25,7 @@ Parameters:
   
   DBName:
     Type: String
-    Default: fabrica-gestor-documental
+    Default: gestor_documental
     Description: Database Name
   
   DBUser:
@@ -50,6 +50,17 @@ Parameters:
     Type: AWS::EC2::Subnet::Id
     Description: Second private subnet for Lambda functions
 
+  TextractDebugMode:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Enable Textract debug mode for troubleshooting
+  
+  TextractRegion:
+    Type: String
+    Default: "us-east-1"
+    Description: AWS Region for Textract service
+
 Resources:
   # Capa compartida
   CommonLayer:
@@ -61,6 +72,7 @@ Resources:
       CompatibleRuntimes:
         - python3.9
       RetentionPolicy: Retain
+
   # Lambda Functions - Creamos las funciones primero
   DocumentUploadProcessorFunction:
     Type: AWS::Serverless::Function
@@ -72,6 +84,7 @@ Resources:
       Layers:
         - !Ref CommonLayer
       Policies:
+        # POLÍTICAS EXISTENTES...
         - Statement:
             - Effect: Allow
               Action:
@@ -96,12 +109,26 @@ Resources:
             QueueName: !GetAtt DocumentClassificationQueue.QueueName
         - SQSSendMessagePolicy:
             QueueName: !GetAtt ThumbnailsQueue.QueueName
+        # 🔧 NUEVAS POLÍTICAS NECESARIAS PARA TEXTRACT:
         - Statement:
             - Effect: Allow
               Action:
                 - textract:StartDocumentAnalysis
                 - textract:StartDocumentTextDetection
+                - textract:StopDocumentAnalysis  # Para cancelar jobs de prueba
+                - textract:GetDocumentAnalysis   # Para validaciones
               Resource: '*'
+        - Statement:
+            - Effect: Allow
+              Action:
+                - iam:PassRole
+              Resource: !GetAtt TextractSNSRole.Arn
+        # 🔧 POLÍTICA PARA ACCEDER AL TOPIC SNS:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sns:GetTopicAttributes
+              Resource: !Ref TextractCompletionTopic
         - VPCAccessPolicy: {}
       VpcConfig:
         SecurityGroupIds:
@@ -116,6 +143,9 @@ Resources:
           TEXTRACT_SNS_TOPIC: !Ref TextractCompletionTopic
           TEXTRACT_ROLE_ARN: !GetAtt TextractSNSRole.Arn
           THUMBNAILS_QUEUE_URL: !Ref ThumbnailsQueue
+          # 🔧 NUEVAS VARIABLES DE ENTORNO OPCIONALES:
+          TEXTRACT_DEBUG_MODE: !Ref TextractDebugMode  # Cambiar a "true" para debugging
+          LOG_LEVEL: "INFO"
  
   # Permiso para permitir que S3 invoque la función Lambda
   DocumentUploadProcessorPermission:
@@ -217,15 +247,16 @@ Resources:
     Properties:
       QueueName: !Sub ${AWS::StackName}-financial-dlq
       MessageRetentionPeriod: 1209600 # 14 days
+
   # SQS Queue para generación de miniaturas
   ThumbnailsQueue:
-   Type: AWS::SQS::Queue
-   Properties:
-    QueueName: !Sub ${AWS::StackName}-thumbnails-queue
-    VisibilityTimeout: 300
-    RedrivePolicy:
-      deadLetterTargetArn: !GetAtt ThumbnailsDLQ.Arn
-      maxReceiveCount: 3
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-thumbnails-queue
+      VisibilityTimeout: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ThumbnailsDLQ.Arn
+        maxReceiveCount: 3
 
   ThumbnailsDLQ:
     Type: AWS::SQS::Queue
@@ -301,8 +332,9 @@ Resources:
             Principal:
               Service: textract.amazonaws.com
             Action: sts:AssumeRole
+      # 🔧 POLÍTICA GESTIONADA ACTUALIZADA:
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AmazonTextractFullAccess
+        - arn:aws:iam::aws:policy/service-role/AmazonTextractServiceRole
       Policies:
         - PolicyName: TextractSNSPublishPolicy
           PolicyDocument:
@@ -319,9 +351,12 @@ Resources:
               - Effect: Allow
                 Action:
                   - s3:GetObject
-                  - s3:PutObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketLocation
                 Resource:
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-documents-processed"
                   - !Sub "arn:aws:s3:::${AWS::StackName}-documents-processed/*"
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-documents-input"
                   - !Sub "arn:aws:s3:::${AWS::StackName}-documents-input/*"
 
   # Clasificador optimizado (solo "enrutador inteligente")
@@ -448,8 +483,8 @@ Resources:
       CodeUri: src/textract_callback/
       Handler: app.lambda_handler
       Description: Procesa resultados de Textract y extrae datos completos
-      Timeout: 120  # Mayor timeout para procesamiento exhaustivo
-      MemorySize: 1536  # Mayor memoria para procesamiento
+      Timeout: 120
+      MemorySize: 1536
       Layers:
         - !Ref CommonLayer
       Events:
@@ -473,6 +508,14 @@ Resources:
               Action:
                 - textract:GetDocumentAnalysis
                 - textract:GetDocumentTextDetection
+                # 🔧 PERMISOS ADICIONALES PARA DEBUGGING:
+                - textract:DescribeDocumentAnalysis
+                - textract:DescribeDocumentTextDetection
+              Resource: '*'
+        # 🔧 PERMISOS PARA COMPREHEND SI SE USA:
+        - Statement:
+            - Effect: Allow
+              Action:
                 - comprehend:DetectEntities
                 - comprehend:DetectKeyPhrases
                 - comprehend:ClassifyDocument
@@ -714,10 +757,24 @@ Outputs:
     Description: "Textract Callback Lambda Function ARN"
     Value: !GetAtt TextractCallbackFunction.Arn
   
-  TextractCompletionTopicARN:
-    Description: "Textract Completion Topic ARN"
+  TextractCompletionTopicArn:
+    Description: "ARN of the Textract Completion Topic"
     Value: !Ref TextractCompletionTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-TextractCompletionTopicArn"
   
+  TextractSNSRoleArn:
+    Description: "ARN of the Textract SNS Role"
+    Value: !GetAtt TextractSNSRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-TextractSNSRoleArn"
+
+  LambdaSecurityGroupId:
+    Description: "Security Group ID for Lambda functions"
+    Value: !Ref LambdaSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaSecurityGroupId"
+
   DocumentNotificationTopicARN:
     Description: "Document Notifications Topic ARN"
     Value: !Ref DocumentNotificationTopic

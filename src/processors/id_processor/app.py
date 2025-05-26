@@ -33,13 +33,13 @@ logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
 
 # Patrones regex para extraer información de documentos de identidad
 DNI_PATTERN = r'(?i)(?:DNI|Documento Nacional de Identidad)[^\d]*(\d{8}[A-Z]?)'
-PASSPORT_PATTERN = r'(?i)(?:Pasaporte|Passport)[^\d]*([A-Z]{1,2}[0-9]{6,7})'
+PASSPORT_PATTERN = r'[A-Z]{2}\d{7}'
 NAME_PATTERN = r'(?i)(?:Nombre|Name)[^\w]*([\w\s]+)'
 SURNAME_PATTERN = r'(?i)(?:Apellidos|Surname)[^\w]*([\w\s]+)'
 DOB_PATTERN = r'(?i)(?:Fecha de nacimiento|Date of birth)[^\d]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})'
 EXPIRY_PATTERN = r'(?i)(?:Fecha de caducidad|Date of expiry)[^\d]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})'
 NATIONALITY_PATTERN = r'(?i)(?:Nacionalidad|Nationality)[^\w]*([\w\s]+)'
-PANAMA_ID_PATTERN = r'(?i)(?:\b|cedula|identidad|id)[^\d]*(\d{1,2}-\d{1,3}-\d{1,4})'
+PANAMA_ID_PATTERN = r'\b(\d{1,2}-\d{3,4}-\d{1,4})\b'
 # Patrones específicos para fechas en documentos panameños
 PANAMA_ISSUE_DATE_PATTERN = r'(?:[XE]XPEDIDA|EMITIDA):?\s*(\d{1,2}[-\s][a-zA-Zéúíóá]+[-\s]\d{4})'
 PANAMA_EXPIRY_DATE_PATTERN = r'(?:EXPIRA|VENCE):?\s*(\d{1,2}[-\s][a-zA-Zéúíóá]+[-\s]\d{4})'
@@ -126,351 +126,6 @@ def get_extracted_data_from_db(document_id):
         logger.error(traceback.format_exc())
         return None
     
-def format_date_panama(date_str):
-    """
-    Convierte fechas en formato panameño (DD-mes-YYYY) a formato ISO (YYYY-MM-DD)
-    Por ejemplo: '02-ago-2023' -> '2023-08-02'
-    """
-    if not date_str:
-        return None
-    
-    # Limpiar la cadena de espacios extras
-    date_str = re.sub(r'\s+', '-', date_str.strip())
-    
-    # Diccionario de meses en español a número
-    month_map = {
-        'ene': '01', 'feb': '02', 'mar': '03', 'abr': '04', 'may': '05', 'jun': '06',
-        'jul': '07', 'ago': '08', 'sep': '09', 'oct': '10', 'nov': '11', 'dic': '12',
-        'enero': '01', 'febrero': '02', 'marzo': '03', 'abril': '04', 'mayo': '05', 'junio': '06',
-        'julio': '07', 'agosto': '08', 'septiembre': '09', 'octubre': '10', 'noviembre': '11', 'diciembre': '12'
-    }
-    
-    try:
-        # Separar día, mes y año (manejar tanto guiones como espacios)
-        parts = re.split(r'[-\s]+', date_str)
-        if len(parts) != 3:
-            logger.warning(f"Formato de fecha no reconocido: {date_str}")
-            return None
-        
-        day = parts[0].strip().zfill(2)
-        month_text = parts[1].strip().lower()
-        year = parts[2].strip()
-        
-        # Convertir mes a número
-        if month_text in month_map:
-            month = month_map[month_text]
-        else:
-            # Si no se encuentra el mes exacto, intentar con las primeras tres letras
-            month_abbr = month_text[:3]
-            if month_abbr in month_map:
-                month = month_map[month_abbr]
-            else:
-                logger.warning(f"Mes no reconocido: {month_text}")
-                return None
-        
-        # Formatear en ISO
-        return f"{year}-{month}-{day}"
-    except Exception as e:
-        logger.warning(f"Error al procesar fecha '{date_str}': {str(e)}")
-        return None
-
-def extract_id_document_data(text, entidades=None, metadatos=None):
-    """
-    VERSIÓN MEJORADA: Extrae información específica de documentos de identidad
-    """
-    
-    logger.info(f"📖 Iniciando extracción de datos de identificación")
-    logger.info(f"📏 Longitud del texto: {len(text)} caracteres")
-    
-    # Usar la función mejorada
-    extracted_data = extract_id_document_data_improved(text, entidades, metadatos)
-    
-    # ==================== VALORES POR DEFECTO INTELIGENTES ====================
-    
-    # Solo aplicar valores por defecto si realmente no se encontró nada
-    if not extracted_data.get('numero_identificacion'):
-        logger.warning("⚠️ No se pudo extraer número de identificación del documento")
-        # NO asignar AUTO-ID aquí, mejor marcar para revisión manual
-    
-    if not extracted_data.get('nombre_completo'):
-        logger.warning("⚠️ No se pudo extraer nombre completo del documento")
-    
-    if not extracted_data.get('fecha_emision'):
-        logger.warning("⚠️ No se pudo extraer fecha de emisión")
-        # Solo como último recurso
-        extracted_data['fecha_emision'] = datetime.now().strftime('%Y-%m-%d')
-    
-    if not extracted_data.get('fecha_expiracion'):
-        logger.warning("⚠️ No se pudo extraer fecha de expiración")
-        # Calcular basado en fecha de emisión si existe
-        if extracted_data.get('fecha_emision'):
-            try:
-                emision_date = datetime.strptime(extracted_data['fecha_emision'], '%Y-%m-%d')
-                years_to_add = 10  # Por defecto 10 años
-                exp_date = emision_date.replace(year=emision_date.year + years_to_add)
-                extracted_data['fecha_expiracion'] = exp_date.strftime('%Y-%m-%d')
-            except:
-                extracted_data['fecha_expiracion'] = (datetime.now() + timedelta(days=3650)).strftime('%Y-%m-%d')
-        else:
-            extracted_data['fecha_expiracion'] = (datetime.now() + timedelta(days=3650)).strftime('%Y-%m-%d')
-    
-    # ==================== LOG DE RESULTADOS ====================
-    
-    tipo_detectado = extracted_data.get('tipo_identificacion', 'desconocido')
-    
-    if tipo_detectado != 'desconocido':
-        logger.info(f"✅ Tipo de documento detectado: {tipo_detectado}")
-        logger.info(f"📝 Número: {extracted_data.get('numero_identificacion', 'NO DETECTADO')}")
-        logger.info(f"👤 Nombre: {extracted_data.get('nombre_completo', 'NO DETECTADO')}")
-        logger.info(f"🌍 País: {extracted_data.get('pais_emision', 'NO DETECTADO')}")
-        logger.info(f"📅 Emisión: {extracted_data.get('fecha_emision', 'NO DETECTADO')}")
-        logger.info(f"📅 Expiración: {extracted_data.get('fecha_expiracion', 'NO DETECTADO')}")
-        
-        if extracted_data.get('genero'):
-            logger.info(f"👥 Género: {extracted_data.get('genero')}")
-        if extracted_data.get('lugar_nacimiento'):
-            logger.info(f"🏠 Lugar nacimiento: {extracted_data.get('lugar_nacimiento')}")
-        if extracted_data.get('autoridad_emision'):
-            logger.info(f"🏛️ Autoridad: {extracted_data.get('autoridad_emision')}")
-    else:
-        logger.error(f"❌ No se pudo determinar el tipo de documento")
-        logger.error(f"📝 Texto analizado (primeros 500 chars): {text[:500]}")
-    
-    return extracted_data
-
-def extract_passport_data(text, extracted_data):
-    """Extrae datos específicos de pasaportes"""
-    
-    # Número de pasaporte
-    if not extracted_data['numero_identificacion']:
-        passport_patterns = [
-            r'(?i)(?:PASSPORT|PASAPORTE)\s*(?:NO|N[Oº]|NUMBER|NÚMERO)[:\s]*([A-Z0-9]{6,9})',
-            r'(?i)P[A-Z]{3}(\d{5,7})',  # Formato P + país + números
-            r'(?i)([A-Z]{1,2}\d{6,8})',  # Formato general de pasaporte
-            r'(?i)(?:NO|N[Oº])[:\s]*([A-Z0-9]{6,9})',
-        ]
-        
-        for pattern in passport_patterns:
-            match = re.search(pattern, text)
-            if match:
-                extracted_data['numero_identificacion'] = match.group(1).strip()
-                break
-    
-    # Nombres y apellidos (formato pasaporte)
-    if not extracted_data['nombre_completo']:
-        name_patterns = [
-            r'(?i)SURNAME[:\s]+([A-ZÁÉÍÓÚÑ\s]+)\s+GIVEN\s+NAMES?[:\s]+([A-ZÁÉÍÓÚÑ\s]+)',
-            r'(?i)APELLIDOS?[:\s]+([A-ZÁÉÍÓÚÑ\s]+)\s+NOMBRES?[:\s]+([A-ZÁÉÍÓÚÑ\s]+)',
-            r'(?i)NOM[:\s]+([A-ZÁÉÍÓÚÑ\s]+)\s+PRENOM[:\s]+([A-ZÁÉÍÓÚÑ\s]+)',
-        ]
-        
-        for pattern in name_patterns:
-            match = re.search(pattern, text)
-            if match:
-                apellidos = match.group(1).strip()
-                nombres = match.group(2).strip()
-                extracted_data['apellidos'] = apellidos
-                extracted_data['nombre'] = nombres
-                extracted_data['nombre_completo'] = f"{nombres} {apellidos}"
-                break
-    
-    # Lugar de nacimiento
-    birth_place_patterns = [
-        r'(?i)(?:PLACE OF BIRTH|LUGAR DE NACIMIENTO)[:\s]+([A-ZÁÉÍÓÚÑ\s,]+)',
-        r'(?i)(?:LIEU DE NAISSANCE)[:\s]+([A-ZÁÉÍÓÚÑ\s,]+)',
-    ]
-    
-    for pattern in birth_place_patterns:
-        match = re.search(pattern, text)
-        if match:
-            extracted_data['lugar_nacimiento'] = match.group(1).strip()
-            break
-    
-    # Autoridad de emisión
-    authority_patterns = [
-        r'(?i)(?:AUTHORITY|AUTORIDAD)[:\s]+([A-ZÁÉÍÓÚÑ\s,]+)',
-        r'(?i)(?:ISSUED BY|EMITIDO POR)[:\s]+([A-ZÁÉÍÓÚÑ\s,]+)',
-    ]
-    
-    for pattern in authority_patterns:
-        match = re.search(pattern, text)
-        if match:
-            extracted_data['autoridad_emision'] = match.group(1).strip()
-            break
-    
-    # Fechas (formato internacional)
-    if not extracted_data['fecha_emision']:
-        issue_patterns = [
-            r'(?i)(?:DATE OF ISSUE|FECHA DE EXPEDICIÓN)[:\s]+(\d{1,2}[/.\s]\d{1,2}[/.\s]\d{2,4})',
-            r'(?i)(?:DATE D\'ÉMISSION)[:\s]+(\d{1,2}[/.\s]\d{1,2}[/.\s]\d{2,4})',
-        ]
-        
-        for pattern in issue_patterns:
-            match = re.search(pattern, text)
-            if match:
-                extracted_data['fecha_emision'] = normalize_date_international(match.group(1))
-                break
-    
-    if not extracted_data['fecha_expiracion']:
-        expiry_patterns = [
-            r'(?i)(?:DATE OF EXPIRY|FECHA DE CADUCIDAD)[:\s]+(\d{1,2}[/.\s]\d{1,2}[/.\s]\d{2,4})',
-            r'(?i)(?:DATE D\'EXPIRATION)[:\s]+(\d{1,2}[/.\s]\d{1,2}[/.\s]\d{2,4})',
-        ]
-        
-        for pattern in expiry_patterns:
-            match = re.search(pattern, text)
-            if match:
-                extracted_data['fecha_expiracion'] = normalize_date_international(match.group(1))
-                break
-    
-    # Sexo/Género
-    if not extracted_data['genero']:
-        sex_patterns = [
-            r'(?i)(?:SEX|SEXO|SEXE)[:\s]+([MFmf])',
-        ]
-        
-        for pattern in sex_patterns:
-            match = re.search(pattern, text)
-            if match:
-                extracted_data['genero'] = match.group(1).upper()
-                break
-    
-    # Nacionalidad
-    if not extracted_data['nacionalidad']:
-        nationality_patterns = [
-            r'(?i)(?:NATIONALITY|NACIONALIDAD|NATIONALITÉ)[:\s]+([A-ZÁÉÍÓÚÑ\s]+)',
-        ]
-        
-        for pattern in nationality_patterns:
-            match = re.search(pattern, text)
-            if match:
-                extracted_data['nacionalidad'] = match.group(1).strip()
-                break
-    
-    return extracted_data
-
-def extract_cedula_panama_data(text, extracted_data):
-    """Extrae datos específicos de cédulas panameñas (mantiene tu lógica actual)"""
-    
-    # Tu lógica actual para cédulas panameñas
-    if "REPUBLICA DE PANAMA" in text or "REPÚBLICA DE PANAMÁ" in text:
-        extracted_data['pais_emision'] = 'Panamá'
-        
-        # Extraer número de cédula si no se ha hecho ya
-        if not extracted_data['numero_identificacion']:
-            cedula_match = re.search(r'\b(\d{1,2}-\d{3,4}-\d{1,4})\b', text)
-            if cedula_match:
-                extracted_data['numero_identificacion'] = cedula_match.group(1)
-                extracted_data['tipo_identificacion'] = 'cedula_panama'
-        
-        # Extraer nombre completo con patrones específicos para documentos panameños
-        if not extracted_data['nombre_completo']:
-            # Tus patrones actuales...
-            nombre_patterns = [
-                r'IDENTIDAD\s+\d+\s+([A-ZÁÉÍÓÚÑ\s]+)\s+NOMBRE\s+USUAL',
-                r'TRIBUNAL\s+ELECTORAL\s+([A-Za-záéíóúñÁÉÍÓÚÑ\s]+)\s+NOMBRE\s+USUAL',
-                r'ELECTORAL\s+([A-Za-záéíóúñÁÉÍÓÚÑ\s]+)\s+(?:F|E)ECHA\s+DE\s+NACIMIENTO',
-                r'P\s+A\s+([\w\s]+)\s+N\s+A\s+([\w\s]+)\s+M\s+\d+\s+A',
-            ]
-            
-            for pattern in nombre_patterns:
-                match = re.search(pattern, text)
-                if match:
-                    if len(match.groups()) == 1:
-                        extracted_data['nombre_completo'] = match.group(1).strip()
-                    else:
-                        nombre = match.group(1).strip()
-                        apellido = match.group(2).strip()
-                        extracted_data['nombre_completo'] = f"{nombre} {apellido}"
-                        extracted_data['nombre'] = nombre
-                        extracted_data['apellidos'] = apellido
-                    break
-        
-        # Fechas específicas para Panamá
-        if not extracted_data['fecha_emision']:
-            expedida_patterns = [
-                r'[XE]XPEDIDA:?\s*(\d{1,2}[-\s][a-zA-Zéúíóá]+[-\s]\d{4})',
-                r'EXPEDIDA:?\s*(\d{1,2}[-\s][a-zA-Zéúíóá]+[-\s]\d{4})',
-            ]
-            
-            for pattern in expedida_patterns:
-                match = re.search(pattern, text)
-                if match:
-                    extracted_data['fecha_emision'] = format_date_panama(match.group(1).strip())
-                    break
-        
-        if not extracted_data['fecha_expiracion']:
-            expira_match = re.search(r'EXPIRA:?\s*(\d{1,2}[-\s][a-zA-Zéúíóá]+[-\s]\d{4})', text)
-            if expira_match:
-                extracted_data['fecha_expiracion'] = format_date_panama(expira_match.group(1).strip())
-    
-    return extracted_data
-
-def extract_dni_spain_data(text, extracted_data):
-    """Extrae datos específicos de DNI español"""
-    
-    extracted_data['pais_emision'] = 'España'
-    
-    # Número de DNI
-    if not extracted_data['numero_identificacion']:
-        dni_patterns = [
-            r'(?i)DNI[:\s]*(\d{8}[A-Z])',
-            r'(?i)DOCUMENTO[:\s]+(\d{8}[A-Z])',
-            r'\b(\d{8}[A-Z])\b',
-        ]
-        
-        for pattern in dni_patterns:
-            match = re.search(pattern, text)
-            if match:
-                extracted_data['numero_identificacion'] = match.group(1)
-                break
-    
-    # Resto de la extracción similar a la actual...
-    
-    return extracted_data
-
-def extract_generic_id_data(text, extracted_data):
-    """Extracción genérica para documentos no identificados específicamente"""
-    
-    # Patrones genéricos para cualquier documento de identidad
-    if not extracted_data['numero_identificacion']:
-        generic_patterns = [
-            r'(?i)(?:ID|IDENTIFICATION)[:\s]*([A-Z0-9]{5,15})',
-            r'(?i)(?:NÚMERO|NUMBER)[:\s]*([A-Z0-9]{5,15})',
-            r'(?i)(?:DOC|DOCUMENTO)[:\s]*([A-Z0-9]{5,15})',
-        ]
-        
-        for pattern in generic_patterns:
-            match = re.search(pattern, text)
-            if match:
-                extracted_data['numero_identificacion'] = match.group(1)
-                break
-    
-    return extracted_data
-
-def normalize_date_international(date_str):
-    """Normaliza fechas en formatos internacionales"""
-    if not date_str:
-        return None
-    
-    try:
-        # Limpiar la fecha
-        clean_date = re.sub(r'[^\d/.\s]', '', date_str)
-        
-        # Intentar diferentes formatos
-        formats = ['%d/%m/%Y', '%m/%d/%Y', '%d.%m.%Y', '%Y-%m-%d', '%d %m %Y']
-        
-        for fmt in formats:
-            try:
-                date_obj = datetime.strptime(clean_date.strip(), fmt)
-                return date_obj.strftime('%Y-%m-%d')
-            except ValueError:
-                continue
-                
-        return None
-    except Exception:
-        return None
-
 def register_document_identification_improved(document_id, id_data):
     """
     Versión mejorada que NO inserta datos falsos
@@ -834,10 +489,611 @@ def log_identification_changes(document_id):
     except Exception as e:
         logger.error(f"Error al registrar cambios: {str(e)}")
 
-def extract_id_document_data_improved(text, entidades=None, metadatos=None):
+def extract_cedula_panama_data_improved(text, text_upper, extracted_data):
+    """Extracción mejorada para cédulas panameñas"""
+    
+    extracted_data['pais_emision'] = 'Panamá'
+    
+    # 1. NÚMERO DE CÉDULA
+    cedula_patterns = [
+        r'\b(\d{1,2}-\d{3,4}-\d{1,4})\b',  # 8-236-51, 8-823-2320
+    ]
+    
+    for pattern in cedula_patterns:
+        match = re.search(pattern, text)
+        if match:
+            extracted_data['numero_identificacion'] = match.group(1)
+            logger.info(f"📝 Número de cédula: {match.group(1)}")
+            break
+    
+    # 2. NOMBRE COMPLETO - Patrones específicos para cédulas panameñas
+  # ✅ USAR EXTRACTOR ROBUSTO PARA NOMBRES
+    if not extracted_data.get('nombre_completo'):
+        name_result = extract_name_universal(text, 'cedula_panama')
+        if name_result:
+            extracted_data['nombre_completo'] = name_result['nombre_completo']
+            extracted_data['nombre'] = name_result.get('nombre')
+            extracted_data['apellidos'] = name_result.get('apellidos')
+            logger.info(f"✅ Nombre extraído con patrón robusto: {name_result['pattern_used']}")
+    
+    # Si no se extrajo con el robusto, intentar patrones básicos como fallback
+    if not extracted_data.get('nombre_completo'):
+        basic_patterns = [
+            r'TRIBUNAL ELECTORAL\s+([A-Z\s]+)\s+NOMBRE USUAL',
+            r'ELECTORAL\s+([A-Z\s]+)\s+NOMBRE',
+            r'P\s+A\s+([A-Z\s]+)\s+N\s+A\s+([A-Z\s]+)\s+M',
+        ]
+        
+        for pattern in basic_patterns:
+            match = re.search(pattern, text_upper)
+            if match:
+                if len(match.groups()) == 1:
+                    extracted_data['nombre_completo'] = match.group(1).strip()
+                else:
+                    name_part1 = match.group(1).strip()
+                    name_part2 = match.group(2).strip() if len(match.groups()) > 1 else ""
+                    extracted_data['nombre_completo'] = f"{name_part1} {name_part2}".strip()
+                
+                logger.info(f"👤 Nombre completo (fallback): {extracted_data['nombre_completo']}")
+                break
+    
+    # 3. FECHAS (formato panameño con meses en español)
+    date_patterns = [
+        r'EXPEDIDA:\s*(\d{1,2}-[A-Z]{3}-\d{4})',  # 16-NOV-2017
+        r'EXPIRA:\s*(\d{1,2}-[A-Z]{3}-\d{4})',   # 16-NOV-2027
+        r'FECHA DE NACIMIENTO:\s*(\d{1,2}-[A-Z]{3}-\d{4})',  # 27-ABR-1964
+    ]
+    
+    for pattern in date_patterns:
+        matches = re.findall(pattern, text_upper)
+        if matches:
+            if 'EXPEDIDA' in pattern:
+                extracted_data['fecha_emision'] = convert_spanish_date_improved(matches[0])
+            elif 'EXPIRA' in pattern:
+                extracted_data['fecha_expiracion'] = convert_spanish_date_improved(matches[0])
+            elif 'NACIMIENTO' in pattern:
+                extracted_data['fecha_nacimiento'] = convert_spanish_date_improved(matches[0])
+    
+    # 4. GÉNERO
+    gender_match = re.search(r'SEXO:\s*([MF])', text_upper)
+    if gender_match:
+        extracted_data['genero'] = gender_match.group(1)
+    
+    # 5. LUGAR DE NACIMIENTO
+    birth_place_match = re.search(r'LUGAR DE NACIMIENTO:\s*([A-Z,\s]+)', text_upper)
+    if birth_place_match:
+        extracted_data['lugar_nacimiento'] = birth_place_match.group(1).strip()
+    
+    return extracted_data
+
+#nuevas validaciones
+def validate_id_document_improved(extracted_data):
+    """Validación mejorada con criterios más específicos"""
+    validation = {
+        'is_valid': True,
+        'confidence': 0.8,  # Empezar con confianza alta
+        'errors': [],
+        'warnings': []
+    }
+    
+    # ==================== VALIDACIONES CRÍTICAS ====================
+    
+    # 1. Tipo de documento
+    if not extracted_data.get('tipo_identificacion') or extracted_data['tipo_identificacion'] == 'desconocido':
+        validation['errors'].append("Tipo de documento no identificado")
+        validation['is_valid'] = False
+        validation['confidence'] -= 0.4
+    
+    # 2. Número de identificación
+    if not extracted_data.get('numero_identificacion'):
+        validation['errors'].append("Número de identificación no encontrado")
+        validation['is_valid'] = False
+        validation['confidence'] -= 0.3
+    elif extracted_data['numero_identificacion'].startswith('AUTO-'):
+        validation['errors'].append("Número de identificación generado automáticamente")
+        validation['is_valid'] = False
+        validation['confidence'] -= 0.5
+    
+    # 3. Nombre completo
+    if not extracted_data.get('nombre_completo'):
+        validation['errors'].append("Nombre completo no encontrado")
+        validation['is_valid'] = False
+        validation['confidence'] -= 0.2
+    elif extracted_data['nombre_completo'] == 'Titular no identificado':
+        validation['errors'].append("Nombre genérico asignado")
+        validation['is_valid'] = False
+        validation['confidence'] -= 0.3
+    # ✅ AGREGAR ESTA VALIDACIÓN NUEVA:
+    elif len(extracted_data['nombre_completo']) < 6:
+        validation['warnings'].append("Nombre muy corto, posible extracción incompleta")
+        validation['confidence'] -= 0.1
+    elif not re.search(r'[A-Za-z]', extracted_data['nombre_completo']):
+        validation['warnings'].append("Nombre sin letras válidas")
+        validation['confidence'] -= 0.2
+    
+    # ==================== VALIDACIONES ESPECÍFICAS POR TIPO ====================
+    
+    doc_type = extracted_data.get('tipo_identificacion')
+    
+    if doc_type == 'pasaporte':
+        # Validar formato número pasaporte
+        num_id = extracted_data.get('numero_identificacion', '')
+        if not re.match(r'^[A-Z]{2}\d{7}$', num_id):
+            validation['warnings'].append("Formato de número de pasaporte inusual")
+            validation['confidence'] -= 0.1
+        
+        # Los pasaportes deben tener autoridad de emisión
+        if not extracted_data.get('autoridad_emision'):
+            validation['warnings'].append("Autoridad de emisión no detectada")
+            validation['confidence'] -= 0.05
+        
+        # Validar país de emisión
+        if not extracted_data.get('pais_emision') or extracted_data['pais_emision'] == 'Desconocido':
+            validation['warnings'].append("País de emisión no identificado")
+            validation['confidence'] -= 0.1
+    
+    elif doc_type == 'cedula_panama':
+        # Validar formato cédula panameña
+        num_id = extracted_data.get('numero_identificacion', '')
+        if not re.match(r'^\d{1,2}-\d{3,4}-\d{1,4}$', num_id):
+            validation['warnings'].append("Formato de cédula panameña incorrecto")
+            validation['confidence'] -= 0.2
+        
+        # País debe ser Panamá
+        if extracted_data.get('pais_emision') != 'Panamá':
+            validation['warnings'].append("País de emisión incorrecto para cédula panameña")
+            validation['confidence'] -= 0.1
+    
+    elif doc_type == 'dni':
+        # Validar formato DNI español
+        num_id = extracted_data.get('numero_identificacion', '')
+        if not re.match(r'^\d{8}[A-Z]$', num_id):
+            validation['warnings'].append("Formato de DNI español incorrecto")
+            validation['confidence'] -= 0.2
+    
+    # ==================== VALIDACIONES DE FECHAS ====================
+    
+    fecha_emision = extracted_data.get('fecha_emision')
+    fecha_expiracion = extracted_data.get('fecha_expiracion')
+    
+    # Validar formato de fechas
+    date_pattern = r'^\d{4}-\d{2}-\d{2}$'
+    
+    if fecha_emision and not re.match(date_pattern, str(fecha_emision)):
+        validation['errors'].append("Formato de fecha de emisión inválido")
+        validation['confidence'] -= 0.1
+    
+    if fecha_expiracion and not re.match(date_pattern, str(fecha_expiracion)):
+        validation['errors'].append("Formato de fecha de expiración inválido")
+        validation['confidence'] -= 0.1
+    
+    # Validar lógica de fechas
+    if fecha_emision and fecha_expiracion:
+        try:
+            from datetime import datetime
+            emision_dt = datetime.strptime(str(fecha_emision), '%Y-%m-%d')
+            expiracion_dt = datetime.strptime(str(fecha_expiracion), '%Y-%m-%d')
+            
+            if emision_dt >= expiracion_dt:
+                validation['errors'].append("Fecha de emisión posterior a fecha de expiración")
+                validation['confidence'] -= 0.2
+            
+            # Verificar si el documento ha expirado
+            now = datetime.now()
+            if expiracion_dt < now:
+                validation['warnings'].append("El documento ha expirado")
+                validation['confidence'] -= 0.05
+                
+        except ValueError:
+            validation['errors'].append("Fechas con formato incorrecto")
+            validation['confidence'] -= 0.1
+    
+    # ==================== AJUSTE FINAL DE CONFIANZA ====================
+    
+    # Asegurar que la confianza esté entre 0 y 1
+    validation['confidence'] = max(0.0, min(1.0, validation['confidence']))
+    
+    # Si hay errores críticos, marcar como inválido
+    if len(validation['errors']) > 0:
+        validation['is_valid'] = False
+    
+    logger.info(f"📊 Validación completada - Confianza: {validation['confidence']:.2f}")
+    if validation['errors']:
+        logger.error(f"❌ Errores encontrados: {'; '.join(validation['errors'])}")
+    if validation['warnings']:
+        logger.warning(f"⚠️ Advertencias: {'; '.join(validation['warnings'])}")
+    
+    return validation
+
+def format_date_panama_improved(date_str):
     """
-    Versión mejorada para extraer información de documentos de identidad
-    con mejores patrones y lógica de detección
+    Convierte fechas en formato panameño (DD-mes-YYYY) a formato ISO (YYYY-MM-DD)
+    VERSIÓN MEJORADA que maneja fechas incompletas
+    """
+    if not date_str:
+        return None
+    
+    # Limpiar la cadena de espacios extras
+    date_str = re.sub(r'\s+', '-', date_str.strip())
+    
+    # Diccionario de meses en español a número
+    month_map = {
+        'ene': '01', 'feb': '02', 'mar': '03', 'abr': '04', 'may': '05', 'jun': '06',
+        'jul': '07', 'ago': '08', 'sep': '09', 'oct': '10', 'nov': '11', 'dic': '12',
+        'enero': '01', 'febrero': '02', 'marzo': '03', 'abril': '04', 'mayo': '05', 'junio': '06',
+        'julio': '07', 'agosto': '08', 'septiembre': '09', 'octubre': '10', 'noviembre': '11', 'diciembre': '12'
+    }
+    
+    try:
+        # Separar día, mes y año (manejar tanto guiones como espacios)
+        parts = re.split(r'[-\s]+', date_str)
+        if len(parts) != 3:
+            logger.warning(f"Formato de fecha no reconocido: {date_str}")
+            return None
+        
+        day = parts[0].strip()
+        month_text = parts[1].strip().lower()
+        year = parts[2].strip()
+        
+        # ✅ CORRECCIÓN: Validar y corregir día inválido
+        try:
+            day_int = int(day)
+            if day_int == 0 or day_int > 31:
+                logger.warning(f"Día inválido {day_int}, usando día 01")
+                day = "01"
+            else:
+                day = day.zfill(2)
+        except ValueError:
+            logger.warning(f"Día no numérico '{day}', usando día 01")
+            day = "01"
+        
+        # Convertir mes a número
+        if month_text in month_map:
+            month = month_map[month_text]
+        else:
+            # Si no se encuentra el mes exacto, intentar con las primeras tres letras
+            month_abbr = month_text[:3]
+            if month_abbr in month_map:
+                month = month_map[month_abbr]
+            else:
+                logger.warning(f"Mes no reconocido: {month_text}, usando enero")
+                month = "01"
+        
+        # ✅ CORRECCIÓN: Validar año
+        try:
+            year_int = int(year)
+            if year_int < 1900 or year_int > 2100:
+                logger.warning(f"Año inválido {year_int}")
+                return None
+            year = str(year_int)
+        except ValueError:
+            logger.warning(f"Año no numérico '{year}'")
+            return None
+        
+        # ✅ VALIDACIÓN FINAL: Verificar que la fecha sea válida
+        from datetime import datetime
+        try:
+            # Intentar crear la fecha para validarla
+            test_date = datetime.strptime(f"{year}-{month}-{day}", '%Y-%m-%d')
+            formatted_date = f"{year}-{month}-{day}"
+            logger.info(f"✅ Fecha convertida: '{date_str}' → '{formatted_date}'")
+            return formatted_date
+        except ValueError as ve:
+            logger.warning(f"Fecha resultante inválida: {year}-{month}-{day}, error: {ve}")
+            # Como último recurso, usar el primer día del mes
+            try:
+                test_date = datetime.strptime(f"{year}-{month}-01", '%Y-%m-%d')
+                formatted_date = f"{year}-{month}-01"
+                logger.warning(f"Usando primer día del mes: '{formatted_date}'")
+                return formatted_date
+            except ValueError:
+                logger.error(f"No se pudo crear fecha válida para: {date_str}")
+                return None
+        
+    except Exception as e:
+        logger.warning(f"Error al procesar fecha '{date_str}': {str(e)}")
+        return None
+
+def normalize_date_improved(date_str, default_day="01"):
+    """
+    Normaliza fechas de diferentes formatos a ISO YYYY-MM-DD
+    VERSIÓN MEJORADA que maneja fechas incompletas o malformadas
+    """
+    if not date_str:
+        return None
+    
+    # Limpiar la cadena
+    clean_date = str(date_str).strip()
+    
+    # Si ya está en formato ISO, validarla
+    if re.match(r'^\d{4}-\d{2}-\d{2}$', clean_date):
+        # Verificar que no tenga día/mes 00
+        year, month, day = clean_date.split('-')
+        
+        if month == "00":
+            month = "01"
+            logger.warning(f"Mes 00 corregido a 01 en fecha: {clean_date}")
+        
+        if day == "00":
+            day = default_day
+            logger.warning(f"Día 00 corregido a {default_day} en fecha: {clean_date}")
+        
+        corrected_date = f"{year}-{month}-{day}"
+        
+        # Validar que la fecha sea real
+        try:
+            from datetime import datetime
+            datetime.strptime(corrected_date, '%Y-%m-%d')
+            return corrected_date
+        except ValueError:
+            logger.warning(f"Fecha inválida después de corrección: {corrected_date}")
+            return None
+    
+    # Si tiene formato panameño, usar la función específica
+    if re.search(r'\d{1,2}[-\s][a-zA-Zéúíóá]+[-\s]\d{4}', clean_date):
+        return format_date_panama_improved(clean_date)
+    
+    # Otros formatos internacionales
+    formats_to_try = [
+        '%d/%m/%Y',
+        '%m/%d/%Y', 
+        '%d.%m.%Y',
+        '%Y/%m/%d',
+        '%d %m %Y',
+        '%Y-%m-%d'
+    ]
+    
+    for fmt in formats_to_try:
+        try:
+            from datetime import datetime
+            date_obj = datetime.strptime(clean_date, fmt)
+            return date_obj.strftime('%Y-%m-%d')
+        except ValueError:
+            continue
+    
+    logger.warning(f"No se pudo normalizar la fecha: {date_str}")
+    return None
+
+def extract_passport_data_improved(text, text_upper, extracted_data):
+    """Extracción mejorada para pasaportes"""
+    
+    # 1. NÚMERO DE PASAPORTE - Patrones mejorados
+    passport_number_patterns = [
+        r'PASSPORT\s+NO[:\s]+([A-Z]{2}\d{7})',  # PA0106480
+        r'PASAPORTE\s+NO[:\s]+([A-Z]{2}\d{7})',
+        r'NO[:\s]*([A-Z]{2}\d{7})',
+        r'([A-Z]{2}\d{7})',  # Patrón general para números como PA0106480, PD0404102
+    ]
+    
+    for pattern in passport_number_patterns:
+        match = re.search(pattern, text_upper)
+        if match:
+            extracted_data['numero_identificacion'] = match.group(1)
+            logger.info(f"📝 Número de pasaporte encontrado: {match.group(1)}")
+            break
+    
+    # 2. NOMBRES Y APELLIDOS
+    if not extracted_data.get('nombre_completo'):
+        name_result = extract_name_universal(text, 'pasaporte')
+        if name_result:
+            extracted_data['nombre_completo'] = name_result['nombre_completo']
+            extracted_data['nombre'] = name_result.get('nombre')
+            extracted_data['apellidos'] = name_result.get('apellidos')
+            logger.info(f"✅ Nombre de pasaporte extraído: {name_result['nombre_completo']}")
+            logger.info(f"   Patrón usado: {name_result['pattern_used']}")
+    
+    # Si no se extrajo con el robusto, intentar patrones básicos como fallback
+    if not extracted_data.get('nombre_completo'):
+        basic_name_patterns = [
+            r'APELLIDOS/SURNAME\s+([A-Z\s]+)\s+NOMBRES\s*/\s*GIVEN\s+NAMES\s+([A-Z\s]+?)(?:\s+SPECIMEN|\s+\d|\s+[A-Z]{3}|$)',
+            r'SURNAME\s+([A-Z\s]+)\s+GIVEN\s+NAMES\s+([A-Z\s]+?)(?:\s+SPECIMEN|\s+\d|\s+[A-Z]{3}|$)',
+        ]
+        
+        for pattern in basic_name_patterns:
+            match = re.search(pattern, text_upper)
+            if match and len(match.groups()) >= 2:
+                apellidos = match.group(1).strip()
+                nombres = match.group(2).strip()
+                
+                extracted_data['apellidos'] = apellidos
+                extracted_data['nombre'] = nombres
+                extracted_data['nombre_completo'] = f"{nombres} {apellidos}"
+                logger.info(f"👤 Nombre completo (fallback): {extracted_data['nombre_completo']}")
+                break
+    
+    # 3. PAÍS DE EMISIÓN
+    country_patterns = [
+        r'REPUBLICA DE PANAMA|REPUBLIC OF PANAMA',
+        r'ESPAÑA|SPAIN',
+        r'COLOMBIA',
+        r'ESTADOS UNIDOS|UNITED STATES',
+        r'MEXICO|MÉXICO',
+    ]
+    
+    for pattern in country_patterns:
+        if re.search(pattern, text_upper):
+            if 'PANAMA' in pattern:
+                extracted_data['pais_emision'] = 'Panamá'
+            elif 'ESPAÑA' in pattern or 'SPAIN' in pattern:
+                extracted_data['pais_emision'] = 'España'
+            elif 'COLOMBIA' in pattern:
+                extracted_data['pais_emision'] = 'Colombia'
+            elif 'ESTADOS UNIDOS' in pattern or 'UNITED STATES' in pattern:
+                extracted_data['pais_emision'] = 'Estados Unidos'
+            elif 'MEXICO' in pattern or 'MÉXICO' in pattern:
+                extracted_data['pais_emision'] = 'México'
+            logger.info(f"🌍 País de emisión: {extracted_data['pais_emision']}")
+            break
+    
+    # 4. FECHAS (emisión y expiración) - MEJORADO
+    date_patterns = [
+        r'DATE OF ISSUE\s+(\d{1,2}\s+[A-Z]{3}\s+\d{4})',  # 02 ENE 2014
+        r'FECHA DE EXPEDICION\s+(\d{1,2}\s+[A-Z]{3}\s+\d{4})',
+        r'DATE OF EXPIRY\s+(\d{1,2}\s+[A-Z]{3}\s+\d{4})',  # 02 ENE 2019
+        r'FECHA DE VENCIMIENTO\s+(\d{1,2}\s+[A-Z]{3}\s+\d{4})',
+        # Patrones adicionales para diferentes formatos
+        r'ISSUED:\s*(\d{1,2}[-\s][A-Z]{3}[-\s]\d{4})',
+        r'EXPIRES:\s*(\d{1,2}[-\s][A-Z]{3}[-\s]\d{4})',
+    ]
+    
+    for pattern in date_patterns:
+        matches = re.findall(pattern, text_upper)
+        if matches:
+            if 'ISSUE' in pattern or 'EXPEDICION' in pattern or 'ISSUED' in pattern:
+                # Usar función mejorada
+                extracted_data['fecha_emision'] = normalize_date_improved(matches[0])
+                logger.info(f"📅 Fecha emisión: {extracted_data['fecha_emision']}")
+            elif 'EXPIRY' in pattern or 'VENCIMIENTO' in pattern or 'EXPIRES' in pattern:
+                extracted_data['fecha_expiracion'] = normalize_date_improved(matches[0])
+                logger.info(f"📅 Fecha expiración: {extracted_data['fecha_expiracion']}")
+    
+    # 5. GÉNERO
+    gender_patterns = [
+        r'SEXO/SEX\s+([MF])',
+        r'SEX\s+([MF])',
+        r'SEXO\s+([MF])',
+        r'GENDER\s+([MF])',
+        r'([MF])\s+(?:MALE|FEMALE|MASCULINO|FEMENINO)',
+    ]
+    
+    for pattern in gender_patterns:
+        match = re.search(pattern, text_upper)
+        if match:
+            extracted_data['genero'] = match.group(1)
+            logger.info(f"👥 Género: {extracted_data['genero']}")
+            break
+    
+    # 6. FECHA DE NACIMIENTO
+    birth_date_patterns = [
+        r'DATE OF BIRTH\s+(\d{1,2}\s+[A-Z]{3}\s+\d{4})',  # 21 MAR 1991
+        r'FECHA DE NACIMIENTO\s+(\d{1,2}\s+[A-Z]{3}\s+\d{4})',
+        r'BORN:\s*(\d{1,2}[-\s][A-Z]{3}[-\s]\d{4})',
+        r'DOB\s+(\d{1,2}\s+[A-Z]{3}\s+\d{4})',
+        # Patrón general de fecha (usado con cuidado)
+        r'(?:NACIMIENTO|BIRTH|BORN).*?(\d{1,2}\s+[A-Z]{3}\s+\d{4})',
+    ]
+    
+    for pattern in birth_date_patterns:
+        match = re.search(pattern, text_upper)
+        if match:
+            extracted_data['fecha_nacimiento'] = normalize_date_improved(match.group(1))
+            logger.info(f"🎂 Fecha nacimiento: {extracted_data['fecha_nacimiento']}")
+            break
+    
+    # 7. AUTORIDAD DE EMISIÓN
+    authority_patterns = [
+        r'AUTORIDAD[:\s]+([A-Z\s/]+?)(?:\s+AUTHORITY|\s*$)',
+        r'AUTHORITY[:\s]+([A-Z\s/]+?)(?:\s+AUTORIDAD|\s*$)',
+        r'ISSUED BY[:\s]+([A-Z\s/]+?)(?:\s+EMITIDO|\s*$)',
+        r'EMITIDO POR[:\s]+([A-Z\s/]+?)(?:\s+ISSUED|\s*$)',
+    ]
+    
+    # Verificar patrones específicos primero
+    if 'PASAPORTES/PANAMA' in text_upper or 'PASSPORTS/PANAMA' in text_upper:
+        extracted_data['autoridad_emision'] = 'Pasaportes/Panamá'
+        logger.info(f"🏛️ Autoridad: {extracted_data['autoridad_emision']}")
+    elif 'MINISTERIO DEL INTERIOR' in text_upper:
+        extracted_data['autoridad_emision'] = 'Ministerio del Interior'
+        logger.info(f"🏛️ Autoridad: {extracted_data['autoridad_emision']}")
+    else:
+        # Buscar con patrones generales
+        for pattern in authority_patterns:
+            match = re.search(pattern, text_upper)
+            if match:
+                authority = match.group(1).strip()
+                # Limpiar texto innecesario
+                authority = re.sub(r'(SPECIMEN|MUESTRA)', '', authority).strip()
+                if len(authority) > 5:  # Solo si tiene contenido significativo
+                    extracted_data['autoridad_emision'] = authority
+                    logger.info(f"🏛️ Autoridad: {extracted_data['autoridad_emision']}")
+                    break
+    
+    # 8. NACIONALIDAD
+    nationality_patterns = [
+        r'NACIONALIDAD[:\s/]+([A-Z]+)',
+        r'NATIONALITY[:\s/]+([A-Z]+)',
+        r'NATIONAL[:\s]+([A-Z]+)',
+        r'CITIZEN[:\s]+([A-Z]+)',
+    ]
+    
+    for pattern in nationality_patterns:
+        match = re.search(pattern, text_upper)
+        if match:
+            nationality = match.group(1).strip()
+            # Convertir códigos comunes a nombres completos
+            nationality_map = {
+                'PANAMENA': 'Panameña',
+                'PANAMANIAN': 'Panameña',
+                'ESPANOLA': 'Española',
+                'SPANISH': 'Española',
+                'COLOMBIANA': 'Colombiana',
+                'COLOMBIAN': 'Colombiana',
+                'MEXICANA': 'Mexicana',
+                'MEXICAN': 'Mexicana',
+                'ESTADOUNIDENSE': 'Estadounidense',
+                'AMERICAN': 'Estadounidense',
+                'USA': 'Estadounidense',
+                'PAN': 'Panameña',
+                'ESP': 'Española',
+                'COL': 'Colombiana',
+                'MEX': 'Mexicana',
+            }
+            
+            extracted_data['nacionalidad'] = nationality_map.get(nationality, nationality)
+            logger.info(f"🏳️ Nacionalidad: {extracted_data['nacionalidad']}")
+            break
+    
+    # 9. LUGAR DE NACIMIENTO
+    birth_place_patterns = [
+        r'(?:PLACE OF BIRTH|LUGAR DE NACIMIENTO)[:\s]+([A-ZÁÉÍÓÚÑ\s,]+?)(?:\s+LIEU|\s+DATE|\s*$)',
+        r'(?:LIEU DE NAISSANCE)[:\s]+([A-ZÁÉÍÓÚÑ\s,]+?)(?:\s+PLACE|\s+DATE|\s*$)',
+        r'BORN IN[:\s]+([A-ZÁÉÍÓÚÑ\s,]+?)(?:\s+DATE|\s*$)',
+        r'NACIDO EN[:\s]+([A-ZÁÉÍÓÚÑ\s,]+?)(?:\s+FECHA|\s*$)',
+    ]
+    
+    for pattern in birth_place_patterns:
+        match = re.search(pattern, text_upper)
+        if match:
+            place = match.group(1).strip()
+            # Limpiar texto innecesario
+            place = re.sub(r'(SPECIMEN|MUESTRA)', '', place).strip()
+            if len(place) > 3:  # Solo si tiene contenido significativo
+                extracted_data['lugar_nacimiento'] = place
+                logger.info(f"🏠 Lugar de nacimiento: {extracted_data['lugar_nacimiento']}")
+                break
+    
+    # 10. VALIDACIONES ADICIONALES PARA PASAPORTES
+    
+    # Si se detectó un pasaporte pero no se encontró país de emisión, intentar inferirlo
+    if not extracted_data.get('pais_emision') and extracted_data.get('numero_identificacion'):
+        numero = extracted_data['numero_identificacion']
+        # Inferir país por prefijo del número
+        if numero.startswith('PA'):
+            extracted_data['pais_emision'] = 'Panamá'
+            logger.info(f"🌍 País inferido por prefijo: Panamá")
+        elif numero.startswith('ES'):
+            extracted_data['pais_emision'] = 'España'
+            logger.info(f"🌍 País inferido por prefijo: España")
+    
+    # Si no se encontró autoridad pero sí país, asignar autoridad típica
+    if not extracted_data.get('autoridad_emision') and extracted_data.get('pais_emision'):
+        pais = extracted_data['pais_emision']
+        if pais == 'Panamá':
+            extracted_data['autoridad_emision'] = 'Pasaportes/Panamá'
+        elif pais == 'España':
+            extracted_data['autoridad_emision'] = 'Policía Nacional'
+        elif pais == 'Colombia':
+            extracted_data['autoridad_emision'] = 'Cancillería'
+        
+        if extracted_data.get('autoridad_emision'):
+            logger.info(f"🏛️ Autoridad inferida: {extracted_data['autoridad_emision']}")
+    
+    return extracted_data
+
+def extract_id_document_data_improved_core(text, entidades=None, metadatos=None):
+    """
+    Función principal de extracción de datos de documentos de identidad
+    VERSIÓN MEJORADA con mejores patrones y lógica de detección
     """
     
     # Limpiar texto para mejor procesamiento
@@ -921,234 +1177,377 @@ def extract_id_document_data_improved(text, entidades=None, metadatos=None):
     elif extracted_data['tipo_identificacion'] == 'cedula_panama':
         extracted_data = extract_cedula_panama_data_improved(text, text_upper, extracted_data)
     elif extracted_data['tipo_identificacion'] == 'dni':
-        extracted_data = extract_dni_spain_data(text, text_upper, extracted_data)
+        extracted_data = extract_dni_spain_data_improved(text, text_upper, extracted_data)
+    else:
+        extracted_data = extract_generic_id_data_improved(text, text_upper, extracted_data)
     
+    # ==================== FALLBACK UNIVERSAL PARA NOMBRES ====================
+    
+    # Si NINGÚN método anterior extrajo nombre, intentar con el extractor universal
+    if not extracted_data.get('nombre_completo'):
+        logger.warning(f"⚠️ Nombre no extraído con métodos específicos, intentando extractor universal...")
+        
+        # Intentar con tipo detectado
+        name_result = extract_name_universal(text, extracted_data.get('tipo_identificacion'))
+        
+        if not name_result:
+            # Intentar sin tipo específico (todos los patrones)
+            name_result = extract_name_universal(text, None)
+        
+        if name_result:
+            extracted_data['nombre_completo'] = name_result['nombre_completo']
+            extracted_data['nombre'] = name_result.get('nombre')
+            extracted_data['apellidos'] = name_result.get('apellidos')
+            logger.info(f"🔧 Nombre rescatado con extractor universal: {name_result['nombre_completo']}")
+            logger.info(f"   Patrón usado: {name_result['pattern_used']}")
+            logger.info(f"   Confianza: {name_result['confidence']}")
+        else:
+            logger.error(f"❌ NO se pudo extraer nombre con ningún método")
     # ==================== VALIDACIÓN Y LIMPIEZA FINAL ====================
     
     # Limpiar y validar datos extraídos
-    extracted_data = clean_and_validate_data(extracted_data)
+    extracted_data = clean_and_validate_data_improved(extracted_data)
     
     return extracted_data
 
-def extract_passport_data_improved(text, text_upper, extracted_data):
-    """Extracción mejorada para pasaportes"""
+def extract_dni_spain_data_improved(text, text_upper, extracted_data):
+    """Extracción mejorada para DNI español"""
     
-    # 1. NÚMERO DE PASAPORTE - Patrones mejorados
-    passport_number_patterns = [
-        r'PASSPORT\s+NO[:\s]+([A-Z]{2}\d{7})',  # PA0106480
-        r'PASAPORTE\s+NO[:\s]+([A-Z]{2}\d{7})',
-        r'NO[:\s]*([A-Z]{2}\d{7})',
-        r'([A-Z]{2}\d{7})',  # Patrón general para números como PA0106480, PD0404102
+    extracted_data['pais_emision'] = 'España'
+    
+    # 1. NÚMERO DE DNI
+    dni_patterns = [
+        r'(?i)DNI[:\s]*(\d{8}[A-Z])',
+        r'(?i)DOCUMENTO[:\s]+(\d{8}[A-Z])',
+        r'\b(\d{8}[A-Z])\b',
+        r'(?i)NACIONAL DE IDENTIDAD[:\s]*(\d{8}[A-Z])',
     ]
     
-    for pattern in passport_number_patterns:
-        match = re.search(pattern, text_upper)
-        if match:
-            extracted_data['numero_identificacion'] = match.group(1)
-            logger.info(f"📝 Número de pasaporte encontrado: {match.group(1)}")
-            break
-    
-    # 2. NOMBRES Y APELLIDOS
-    name_patterns = [
-        # Formato: APELLIDOS/SURNAME ... NOMBRES/GIVEN NAMES ...
-        r'APELLIDOS/SURNAME\s+([A-Z\s]+)\s+NOMBRES\s*/\s*GIVEN\s+NAMES\s+([A-Z\s]+?)(?:\s+SPECIMEN|\s+\d|\s+[A-Z]{3}|$)',
-        r'SURNAME\s+([A-Z\s]+)\s+GIVEN\s+NAMES\s+([A-Z\s]+?)(?:\s+SPECIMEN|\s+\d|\s+[A-Z]{3}|$)',
-        # Buscar en la línea que contiene nombres
-        r'([A-Z]+)\s+([A-Z]+)\s+([A-Z\s]+)\s+([A-Z\s]+)',  # Apellido1 Apellido2 Nombre1 Nombre2
-    ]
-    
-    for pattern in name_patterns:
-        match = re.search(pattern, text_upper)
-        if match and len(match.groups()) >= 2:
-            if len(match.groups()) == 2:
-                apellidos = match.group(1).strip()
-                nombres = match.group(2).strip()
-            else:
-                # Si hay 4 grupos, asumir que son apellido1 apellido2 nombre1 nombre2
-                apellidos = f"{match.group(1).strip()} {match.group(2).strip()}"
-                nombres = f"{match.group(3).strip()} {match.group(4).strip()}"
-            
-            extracted_data['apellidos'] = apellidos
-            extracted_data['nombre'] = nombres
-            extracted_data['nombre_completo'] = f"{nombres} {apellidos}"
-            logger.info(f"👤 Nombre completo: {extracted_data['nombre_completo']}")
-            break
-    
-    # Si no encontramos con patrones estructurados, buscar nombres en texto
-    if not extracted_data['nombre_completo']:
-        # Buscar líneas que contengan nombres (entre números de pasaporte y fecha de nacimiento)
-        lines = text.split('\n')
-        for i, line in enumerate(lines):
-            line_upper = line.upper()
-            # Si la línea contiene un patrón de nombre (solo letras y espacios, al menos 2 palabras)
-            if re.match(r'^[A-Z\s]{10,50}$', line_upper.strip()) and len(line_upper.strip().split()) >= 2:
-                potential_name = line.strip()
-                if len(potential_name) > 10:  # Evitar líneas muy cortas
-                    extracted_data['nombre_completo'] = potential_name
-                    logger.info(f"👤 Nombre encontrado por patrón general: {potential_name}")
-                    break
-    
-    # 3. PAÍS DE EMISIÓN
-    country_patterns = [
-        r'REPUBLICA DE PANAMA|REPUBLIC OF PANAMA',
-        r'ESPAÑA|SPAIN',
-        r'COLOMBIA',
-    ]
-    
-    for pattern in country_patterns:
-        if re.search(pattern, text_upper):
-            if 'PANAMA' in pattern:
-                extracted_data['pais_emision'] = 'Panamá'
-            elif 'ESPAÑA' in pattern or 'SPAIN' in pattern:
-                extracted_data['pais_emision'] = 'España'
-            elif 'COLOMBIA' in pattern:
-                extracted_data['pais_emision'] = 'Colombia'
-            break
-    
-    # 4. FECHAS (emisión y expiración)
-    date_patterns = [
-        r'DATE OF ISSUE\s+(\d{1,2}\s+[A-Z]{3}\s+\d{4})',  # 02 ENE 2014
-        r'FECHA DE EXPEDICION\s+(\d{1,2}\s+[A-Z]{3}\s+\d{4})',
-        r'DATE OF EXPIRY\s+(\d{1,2}\s+[A-Z]{3}\s+\d{4})',  # 02 ENE 2019
-        r'FECHA DE VENCIMIENTO\s+(\d{1,2}\s+[A-Z]{3}\s+\d{4})',
-    ]
-    
-    for pattern in date_patterns:
-        matches = re.findall(pattern, text_upper)
-        if matches:
-            if 'ISSUE' in pattern or 'EXPEDICION' in pattern:
-                extracted_data['fecha_emision'] = convert_spanish_date(matches[0])
-                logger.info(f"📅 Fecha emisión: {extracted_data['fecha_emision']}")
-            elif 'EXPIRY' in pattern or 'VENCIMIENTO' in pattern:
-                extracted_data['fecha_expiracion'] = convert_spanish_date(matches[0])
-                logger.info(f"📅 Fecha expiración: {extracted_data['fecha_expiracion']}")
-    
-    # 5. GÉNERO
-    gender_patterns = [
-        r'SEXO/SEX\s+([MF])',
-        r'SEX\s+([MF])',
-        r'SEXO\s+([MF])',
-    ]
-    
-    for pattern in gender_patterns:
-        match = re.search(pattern, text_upper)
-        if match:
-            extracted_data['genero'] = match.group(1)
-            break
-    
-    # 6. FECHA DE NACIMIENTO
-    birth_date_patterns = [
-        r'DATE OF BIRTH\s+(\d{1,2}\s+[A-Z]{3}\s+\d{4})',  # 21 MAR 1991
-        r'FECHA DE NACIMIENTO\s+(\d{1,2}\s+[A-Z]{3}\s+\d{4})',
-        r'(\d{1,2}\s+[A-Z]{3}\s+\d{4})',  # Patrón general de fecha
-    ]
-    
-    for pattern in birth_date_patterns:
-        match = re.search(pattern, text_upper)
-        if match:
-            extracted_data['fecha_nacimiento'] = convert_spanish_date(match.group(1))
-            logger.info(f"🎂 Fecha nacimiento: {extracted_data['fecha_nacimiento']}")
-            break
-    
-    # 7. AUTORIDAD DE EMISIÓN
-    if 'PASAPORTES/PANAMA' in text_upper:
-        extracted_data['autoridad_emision'] = 'Pasaportes/Panamá'
-    elif 'AUTORIDAD' in text_upper:
-        auth_match = re.search(r'AUTORIDAD[:\s]+([A-Z\s/]+)', text_upper)
-        if auth_match:
-            extracted_data['autoridad_emision'] = auth_match.group(1).strip()
-    
-    # 8. NACIONALIDAD
-    nationality_patterns = [
-        r'NACIONALIDAD[:\s/]+([A-Z]+)',
-        r'NATIONALITY[:\s/]+([A-Z]+)',
-    ]
-    
-    for pattern in nationality_patterns:
-        match = re.search(pattern, text_upper)
-        if match:
-            nationality = match.group(1).strip()
-            if nationality == 'PANAMENA':
-                extracted_data['nacionalidad'] = 'Panameña'
-            elif nationality == 'ESPANOLA':
-                extracted_data['nacionalidad'] = 'Española'
-            else:
-                extracted_data['nacionalidad'] = nationality
-            break
-    
-    return extracted_data
-
-def extract_cedula_panama_data_improved(text, text_upper, extracted_data):
-    """Extracción mejorada para cédulas panameñas"""
-    
-    extracted_data['pais_emision'] = 'Panamá'
-    
-    # 1. NÚMERO DE CÉDULA
-    cedula_patterns = [
-        r'\b(\d{1,2}-\d{3,4}-\d{1,4})\b',  # 8-236-51, 8-823-2320
-    ]
-    
-    for pattern in cedula_patterns:
+    for pattern in dni_patterns:
         match = re.search(pattern, text)
         if match:
             extracted_data['numero_identificacion'] = match.group(1)
-            logger.info(f"📝 Número de cédula: {match.group(1)}")
+            logger.info(f"📝 Número de DNI: {extracted_data['numero_identificacion']}")
             break
     
-    # 2. NOMBRE COMPLETO - Patrones específicos para cédulas panameñas
+    # 2. VALIDAR Y LIMPIAR NÚMERO DE IDENTIFICACIÓN
+    if extracted_data.get('numero_identificacion'):
+        num_id = extracted_data['numero_identificacion']
+        # Conservar solo letras, números y guiones
+        num_id = re.sub(r'[^\w-]', '', num_id)
+        # Remover espacios extras
+        num_id = re.sub(r'\s+', '', num_id)
+        
+        # Validar que tiene contenido significativo
+        if len(num_id) >= 5:
+            extracted_data['numero_identificacion'] = num_id
+        else:
+            logger.warning(f"Número de identificación muy corto: '{num_id}'")
+            extracted_data['numero_identificacion'] = None
+    
+    # 3. LIMPIAR CAMPOS DE TEXTO LIBRE
+    text_fields = ['lugar_nacimiento', 'autoridad_emision', 'nacionalidad']
+    for field in text_fields:
+        if extracted_data.get(field):
+            value = extracted_data[field]
+            # Limpiar texto innecesario
+            value = re.sub(r'(SPECIMEN|MUESTRA)', '', value, flags=re.IGNORECASE)
+            value = re.sub(r'\s+', ' ', value).strip()
+            
+            # Solo mantener si tiene contenido significativo
+            if len(value) >= 3:
+                extracted_data[field] = value
+            else:
+                extracted_data[field] = None
+    
+    # 4. VALIDAR GÉNERO
+    if extracted_data.get('genero'):
+        genero = extracted_data['genero'].upper()
+        if genero in ['M', 'F', 'MALE', 'FEMALE', 'MASCULINO', 'FEMENINO']:
+            # Normalizar a M/F
+            if genero in ['MALE', 'MASCULINO']:
+                extracted_data['genero'] = 'M'
+            elif genero in ['FEMALE', 'FEMENINO']:
+                extracted_data['genero'] = 'F'
+            else:
+                extracted_data['genero'] = genero[0]  # Tomar primera letra
+        else:
+            logger.warning(f"Género no reconocido: {genero}")
+            extracted_data['genero'] = None
+    
+    # 5. VALIDAR PAÍS DE EMISIÓN
+    if extracted_data.get('pais_emision'):
+        pais = extracted_data['pais_emision']
+        # Mapeo de países comunes
+        pais_map = {
+            'PANAMA': 'Panamá',
+            'PANAMÁ': 'Panamá',
+            'SPAIN': 'España',
+            'ESPAÑA': 'España',
+            'COLOMBIA': 'Colombia',
+            'MEXICO': 'México',
+            'MÉXICO': 'México',
+            'UNITED STATES': 'Estados Unidos',
+            'USA': 'Estados Unidos',
+        }
+        
+        pais_upper = pais.upper()
+        if pais_upper in pais_map:
+            extracted_data['pais_emision'] = pais_map[pais_upper]
+        # Si no está en el mapeo pero tiene contenido válido, mantenerlo
+        elif len(pais) >= 3 and pais.replace(' ', '').isalpha():
+            extracted_data['pais_emision'] = pais.title()
+        else:
+            extracted_data['pais_emision'] = None
+    
+    # 6. INFERIR DATOS FALTANTES BASADOS EN TIPO DE DOCUMENTO
+    doc_type = extracted_data.get('tipo_identificacion')
+    
+    if doc_type == 'cedula_panama' and not extracted_data.get('pais_emision'):
+        extracted_data['pais_emision'] = 'Panamá'
+        logger.info("🌍 País inferido: Panamá (por tipo de documento)")
+    
+    elif doc_type == 'dni' and not extracted_data.get('pais_emision'):
+        extracted_data['pais_emision'] = 'España'
+        extracted_data['nacionalidad'] = 'Española'
+        logger.info("🌍 País y nacionalidad inferidos: España/Española (por DNI)")
+    
+    # 7. VALIDAR COHERENCIA DE FECHAS
+    fecha_emision = extracted_data.get('fecha_emision')
+    fecha_expiracion = extracted_data.get('fecha_expiracion')
+    fecha_nacimiento = extracted_data.get('fecha_nacimiento')
+    
+    if fecha_emision and fecha_expiracion:
+        try:
+            from datetime import datetime
+            emision_dt = datetime.strptime(fecha_emision, '%Y-%m-%d')
+            expiracion_dt = datetime.strptime(fecha_expiracion, '%Y-%m-%d')
+            
+            # La fecha de expiración debe ser posterior a la de emisión
+            if emision_dt >= expiracion_dt:
+                logger.warning(f"Fechas incoherentes: emisión {fecha_emision} >= expiración {fecha_expiracion}")
+                # Mantener solo la fecha que parezca más confiable
+                if abs((emision_dt - datetime.now()).days) > abs((expiracion_dt - datetime.now()).days):
+                    extracted_data['fecha_emision'] = None
+                else:
+                    extracted_data['fecha_expiracion'] = None
+        except ValueError:
+            logger.warning("Error al validar coherencia de fechas")
+    
+    if fecha_nacimiento:
+        try:
+            from datetime import datetime
+            nacimiento_dt = datetime.strptime(fecha_nacimiento, '%Y-%m-%d')
+            now = datetime.now()
+            
+            # Validar que la fecha de nacimiento sea razonable
+            age = (now - nacimiento_dt).days / 365.25
+            if age < 0 or age > 120:
+                logger.warning(f"Fecha de nacimiento inválida: {fecha_nacimiento} (edad: {age:.1f} años)")
+                extracted_data['fecha_nacimiento'] = None
+        except ValueError:
+            logger.warning(f"Formato de fecha de nacimiento inválido: {fecha_nacimiento}")
+            extracted_data['fecha_nacimiento'] = None
+    
+    # 8. ASEGURAR TIPO DE DOCUMENTO VÁLIDO
+    if extracted_data.get('tipo_identificacion') == 'desconocido':
+        # Intentar última inferencia basada en datos disponibles
+        if extracted_data.get('numero_identificacion'):
+            numero = extracted_data['numero_identificacion']
+            if re.match(r'^[A-Z]{2}\d{7}', numero):
+                extracted_data['tipo_identificacion'] = 'dni'
+                logger.info(f"🪪 DNI detectado (score: 3)")
+            elif re.match(r'^[A-Z]{2}\d{7}', numero):
+                extracted_data['tipo_identificacion'] = 'pasaporte'
+                logger.info(f"📔 PASAPORTE detectado (score: 3)")
+    
+    # 2. NOMBRE COMPLETO
     name_patterns = [
-        r'TRIBUNAL ELECTORAL\s+([A-Z\s]+)\s+NOMBRE USUAL',
-        r'ELECTORAL\s+([A-Z\s]+)\s+NOMBRE',
-        r'P\s+A\s+([A-Z\s]+)\s+N\s+A\s+([A-Z\s]+)\s+M',  # Patrón específico del ejemplo
-        # Buscar nombres entre ELECTORAL y NOMBRE USUAL
-        r'ELECTORAL\s+([A-Za-z\s]+?)\s+NOMBRE\s+USUAL',
+        r'(?i)NOMBRE[:\s]+([A-ZÁÉÍÓÚÑ\s]+?)(?:\s+APELLIDOS|\s+FECHA|\s*$)',
+        r'(?i)APELLIDOS[:\s]+([A-ZÁÉÍÓÚÑ\s]+?)(?:\s+NOMBRE|\s+FECHA|\s*$)',
+        # Patrón para nombre completo junto
+        r'(?i)(?:NOMBRE COMPLETO|TITULAR)[:\s]+([A-ZÁÉÍÓÚÑ\s]+?)(?:\s+FECHA|\s+DNI|\s*$)',
     ]
     
     for pattern in name_patterns:
-        match = re.search(pattern, text_upper)
+        match = re.search(pattern, text)
         if match:
-            if len(match.groups()) == 1:
-                extracted_data['nombre_completo'] = match.group(1).strip()
-            else:
-                # Si hay dos grupos, combinarlos
-                name_part1 = match.group(1).strip()
-                name_part2 = match.group(2).strip() if len(match.groups()) > 1 else ""
-                extracted_data['nombre_completo'] = f"{name_part1} {name_part2}".strip()
-            
+            extracted_data['nombre_completo'] = match.group(1).strip()
             logger.info(f"👤 Nombre completo: {extracted_data['nombre_completo']}")
             break
     
-    # 3. FECHAS (formato panameño con meses en español)
+    # 3. FECHAS
     date_patterns = [
-        r'EXPEDIDA:\s*(\d{1,2}-[A-Z]{3}-\d{4})',  # 16-NOV-2017
-        r'EXPIRA:\s*(\d{1,2}-[A-Z]{3}-\d{4})',   # 16-NOV-2027
-        r'FECHA DE NACIMIENTO:\s*(\d{1,2}-[A-Z]{3}-\d{4})',  # 27-ABR-1964
+        r'(?i)(?:FECHA DE EXPEDICIÓN|EXPEDIDO)[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
+        r'(?i)(?:FECHA DE CADUCIDAD|VÁLIDO HASTA)[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
+        r'(?i)(?:FECHA DE NACIMIENTO|NACIDO)[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
     ]
     
     for pattern in date_patterns:
-        matches = re.findall(pattern, text_upper)
+        matches = re.findall(pattern, text)
         if matches:
-            if 'EXPEDIDA' in pattern:
-                extracted_data['fecha_emision'] = convert_spanish_date(matches[0])
-            elif 'EXPIRA' in pattern:
-                extracted_data['fecha_expiracion'] = convert_spanish_date(matches[0])
-            elif 'NACIMIENTO' in pattern:
-                extracted_data['fecha_nacimiento'] = convert_spanish_date(matches[0])
+            if 'EXPEDICIÓN' in pattern or 'EXPEDIDO' in pattern:
+                extracted_data['fecha_emision'] = normalize_date_improved(matches[0])
+            elif 'CADUCIDAD' in pattern or 'VÁLIDO' in pattern:
+                extracted_data['fecha_expiracion'] = normalize_date_improved(matches[0])
+            elif 'NACIMIENTO' in pattern or 'NACIDO' in pattern:
+                extracted_data['fecha_nacimiento'] = normalize_date_improved(matches[0])
     
-    # 4. GÉNERO
-    gender_match = re.search(r'SEXO:\s*([MF])', text_upper)
-    if gender_match:
-        extracted_data['genero'] = gender_match.group(1)
-    
-    # 5. LUGAR DE NACIMIENTO
-    birth_place_match = re.search(r'LUGAR DE NACIMIENTO:\s*([A-Z,\s]+)', text_upper)
+    # 4. LUGAR DE NACIMIENTO
+    birth_place_match = re.search(r'(?i)(?:LUGAR DE NACIMIENTO|NACIDO EN)[:\s]+([A-ZÁÉÍÓÚÑ\s,]+)', text)
     if birth_place_match:
         extracted_data['lugar_nacimiento'] = birth_place_match.group(1).strip()
     
+    # 5. NACIONALIDAD (siempre española para DNI)
+    extracted_data['nacionalidad'] = 'Española'
+    
     return extracted_data
 
-def convert_spanish_date(date_str):
-    """Convierte fechas en español a formato ISO"""
+def extract_generic_id_data_improved(text, text_upper, extracted_data):
+    """Extracción genérica mejorada para documentos no identificados específicamente"""
+    
+    # 1. PATRONES GENÉRICOS PARA NÚMEROS DE IDENTIFICACIÓN
+    generic_id_patterns = [
+        r'(?i)(?:ID|IDENTIFICATION)[:\s]*([A-Z0-9]{5,15})',
+        r'(?i)(?:NÚMERO|NUMBER)[:\s]*([A-Z0-9]{5,15})',
+        r'(?i)(?:DOC|DOCUMENTO)[:\s]*([A-Z0-9]{5,15})',
+        r'(?i)(?:IDENTITY|IDENTIDAD)[:\s]*([A-Z0-9]{5,15})',
+        # Patrones para formatos comunes
+        r'\b([A-Z]{2,3}\d{6,8})\b',  # Formato pasaporte genérico
+        r'\b(\d{7,10})\b',  # Número genérico largo
+    ]
+    
+    for pattern in generic_id_patterns:
+        match = re.search(pattern, text)
+        if match:
+            potential_id = match.group(1)
+            # Validar que no sea una fecha u otro dato
+            if not re.match(r'^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$', potential_id):
+                extracted_data['numero_identificacion'] = potential_id
+                logger.info(f"📝 Número genérico encontrado: {potential_id}")
+                break
+    
+    # 2. PATRONES GENÉRICOS PARA NOMBRES
+    generic_name_patterns = [
+        r'(?i)(?:NOMBRE|NAME)[:\s]+([A-ZÁÉÍÓÚÑ\s]+?)(?:\s+(?:APELLIDO|SURNAME)|\s+\d|\s*$)',
+        r'(?i)(?:TITULAR|HOLDER)[:\s]+([A-ZÁÉÍÓÚÑ\s]+?)(?:\s+\d|\s*$)',
+        r'(?i)(?:FULL NAME|NOMBRE COMPLETO)[:\s]+([A-ZÁÉÍÓÚÑ\s]+?)(?:\s+\d|\s*$)',
+    ]
+    
+    for pattern in generic_name_patterns:
+        match = re.search(pattern, text)
+        if match:
+            extracted_data['nombre_completo'] = match.group(1).strip()
+            logger.info(f"👤 Nombre genérico encontrado: {extracted_data['nombre_completo']}")
+            break
+    
+    # 3. PATRONES GENÉRICOS PARA FECHAS
+    generic_date_patterns = [
+        r'(?i)(?:ISSUED|EMITIDO|EXPEDIDO)[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
+        r'(?i)(?:EXPIRES|EXPIRA|VENCE)[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
+        r'(?i)(?:VALID UNTIL|VÁLIDO HASTA)[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
+    ]
+    
+    for pattern in generic_date_patterns:
+        matches = re.findall(pattern, text)
+        if matches:
+            if 'ISSUED' in pattern or 'EMITIDO' in pattern or 'EXPEDIDO' in pattern:
+                extracted_data['fecha_emision'] = normalize_date_improved(matches[0])
+            elif any(word in pattern for word in ['EXPIRES', 'EXPIRA', 'VENCE', 'VALID']):
+                extracted_data['fecha_expiracion'] = normalize_date_improved(matches[0])
+    
+    # 4. INTENTAR DETECTAR EL TIPO DE DOCUMENTO POR CONTEXTO
+    if extracted_data.get('numero_identificacion'):
+        numero = extracted_data['numero_identificacion']
+        
+        # Si tiene formato de pasaporte
+        if re.match(r'^[A-Z]{2}\d{7}$', numero):
+            extracted_data['tipo_identificacion'] = 'pasaporte'
+            logger.info(f"📔 Tipo inferido por formato de número: pasaporte")
+        
+        # Si tiene formato de cédula panameña
+        elif re.match(r'^\d{1,2}-\d{3,4}-\d{1,4}$', numero):
+            extracted_data['tipo_identificacion'] = 'cedula_panama'
+            extracted_data['pais_emision'] = 'Panamá'
+            logger.info(f"🆔 Tipo inferido por formato de número: cédula panameña")
+        
+        # Si tiene formato de DNI español
+        elif re.match(r'^\d{8}[A-Z]$', numero):
+            extracted_data['tipo_identificacion'] = 'dni'
+            extracted_data['pais_emision'] = 'España'
+            extracted_data['nacionalidad'] = 'Española'
+            logger.info(f"🪪 Tipo inferido por formato de número: DNI español")
+    
+    return extracted_data
+
+def clean_and_validate_data_improved(extracted_data):
+    """Limpia y valida los datos extraídos - VERSIÓN MEJORADA"""
+    
+    # 1. LIMPIAR NOMBRE COMPLETO
+    if extracted_data.get('nombre_completo'):
+        name = extracted_data['nombre_completo']
+        # Eliminar texto no relevante
+        name = re.sub(r'(SPECIMEN|MUESTRA|NOMBRE USUAL)', '', name, flags=re.IGNORECASE)
+        name = re.sub(r'\s+', ' ', name).strip()
+        # Remover caracteres especiales innecesarios
+        name = re.sub(r'[^\w\s\-\']', '', name)
+        
+        # Validar que tiene contenido significativo
+        if len(name) >= 3 and not name.isdigit():
+            extracted_data['nombre_completo'] = name
+        else:
+            logger.warning(f"Nombre limpiado resulta inválido: '{name}'")
+            extracted_data['nombre_completo'] = None
+    
+    # 2. LIMPIAR NÚMERO DE IDENTIFICACIÓN
+    if extracted_data.get('numero_identificacion'):
+        num_id = extracted_data['numero_identificacion']
+        # Conservar solo letras, números y guiones
+        num_id = re.sub(r'[^\w-]', '', num_id)
+        # Remover espacios extras
+        num_id = re.sub(r'\s+', '', num_id)
+        
+        # Validar que tiene contenido significativo
+        if len(num_id) >= 5:
+            extracted_data['numero_identificacion'] = num_id
+        else:
+            logger.warning(f"Número de identificación muy corto: '{num_id}'")
+            extracted_data['numero_identificacion'] = None
+    
+    # 3. LIMPIAR CAMPOS DE TEXTO LIBRE
+    text_fields = ['lugar_nacimiento', 'autoridad_emision', 'nacionalidad']
+    for field in text_fields:
+        if extracted_data.get(field):
+            value = extracted_data[field]
+            # Limpiar texto innecesario
+            value = re.sub(r'(SPECIMEN|MUESTRA)', '', value, flags=re.IGNORECASE)
+            value = re.sub(r'\s+', ' ', value).strip()
+            
+            # Solo mantener si tiene contenido significativo
+            if len(value) >= 3:
+                extracted_data[field] = value
+            else:
+                extracted_data[field] = None
+    
+    # 4. VALIDAR GÉNERO
+    if extracted_data.get('genero'):
+        genero = extracted_data['genero'].upper()
+        if genero in ['M', 'F', 'MALE', 'FEMALE', 'MASCULINO', 'FEMENINO']:
+            # Normalizar a M/F
+            if genero in ['MALE', 'MASCULINO']:
+                extracted_data['genero'] = 'M'
+            elif genero in ['FEMALE', 'FEMENINO']:
+                extracted_data['genero'] = 'F'
+            else:
+                extracted_data['genero'] = genero[0]  # Tomar primera letra
+        else:
+            logger.warning(f"Género no reconocido: {genero}")
+            extracted_data['genero'] = None
+    
+    return extracted_data
+
+def convert_spanish_date_improved(date_str):
+    """Convierte fechas en español a formato ISO - VERSIÓN MEJORADA"""
     if not date_str:
         return None
     
@@ -1156,7 +1555,9 @@ def convert_spanish_date(date_str):
     month_map = {
         'ENE': '01', 'FEB': '02', 'MAR': '03', 'ABR': '04', 'MAY': '05', 'JUN': '06',
         'JUL': '07', 'AGO': '08', 'SEP': '09', 'OCT': '10', 'NOV': '11', 'DIC': '12',
-        'JAN': '01', 'APR': '04', 'AUG': '08', 'DEC': '12'
+        'JAN': '01', 'APR': '04', 'AUG': '08', 'DEC': '12',
+        'ENERO': '01', 'FEBRERO': '02', 'MARZO': '03', 'ABRIL': '04', 'MAYO': '05', 'JUNIO': '06',
+        'JULIO': '07', 'AGOSTO': '08', 'SEPTIEMBRE': '09', 'OCTUBRE': '10', 'NOVIEMBRE': '11', 'DICIEMBRE': '12'
     }
     
     try:
@@ -1165,115 +1566,493 @@ def convert_spanish_date(date_str):
         parts = re.split(r'[-\s]+', clean_date)
         
         if len(parts) == 3:
-            day = parts[0].zfill(2)
-            month_text = parts[1].upper()
-            year = parts[2]
+            day = parts[0].strip()
+            month_text = parts[1].upper().strip()
+            year = parts[2].strip()
             
+            # ✅ VALIDAR DÍA
+            try:
+                day_int = int(day)
+                if day_int == 0 or day_int > 31:
+                    logger.warning(f"Día inválido {day_int}, usando 01")
+                    day = "01"
+                else:
+                    day = str(day_int).zfill(2)
+            except ValueError:
+                day = "01"
+            
+            # ✅ VALIDAR MES
             if month_text in month_map:
                 month = month_map[month_text]
-                return f"{year}-{month}-{day}"
+            else:
+                # Buscar coincidencia parcial
+                for month_name, month_num in month_map.items():
+                    if month_text in month_name or month_name in month_text:
+                        month = month_num
+                        break
+                else:
+                    logger.warning(f"Mes no reconocido: {month_text}, usando 01")
+                    month = "01"
+            
+            # ✅ VALIDAR AÑO
+            try:
+                year_int = int(year)
+                if year_int < 1900 or year_int > 2100:
+                    logger.warning(f"Año inválido: {year_int}")
+                    return None
+                year = str(year_int)
+            except ValueError:
+                logger.warning(f"Año inválido: {year}")
+                return None
+            
+            # ✅ VALIDAR FECHA FINAL
+            from datetime import datetime
+            try:
+                test_date = datetime.strptime(f"{year}-{month}-{day}", '%Y-%m-%d')
+                final_date = f"{year}-{month}-{day}"
+                logger.info(f"✅ Fecha convertida: '{date_str}' → '{final_date}'")
+                return final_date
+            except ValueError:
+                # Usar primer día del mes como fallback
+                try:
+                    test_date = datetime.strptime(f"{year}-{month}-01", '%Y-%m-%d')
+                    final_date = f"{year}-{month}-01"
+                    logger.warning(f"Fecha corregida a: {final_date}")
+                    return final_date
+                except ValueError:
+                    logger.error(f"No se pudo crear fecha válida para: {date_str}")
+                    return None
     
     except Exception as e:
         logger.warning(f"Error convirtiendo fecha '{date_str}': {str(e)}")
     
     return None
 
-def clean_and_validate_data(extracted_data):
-    """Limpia y valida los datos extraídos"""
+def extract_name_universal(text, document_type=None):
+    """
+    Función UNIVERSAL para extraer nombres de documentos de identidad.
+    Maneja TODOS los formatos posibles de documentos panameños, españoles y pasaportes.
     
-    # Limpiar nombre completo
-    if extracted_data.get('nombre_completo'):
-        name = extracted_data['nombre_completo']
-        # Eliminar texto no relevante
-        name = re.sub(r'(SPECIMEN|MUESTRA|NOMBRE USUAL)', '', name)
-        name = re.sub(r'\s+', ' ', name).strip()
-        extracted_data['nombre_completo'] = name
+    Args:
+        text (str): Texto extraído del documento
+        document_type (str): Tipo de documento ('cedula_panama', 'dni', 'pasaporte', etc.)
     
-    # Validar y limpiar número de identificación
-    if extracted_data.get('numero_identificacion'):
-        num_id = extracted_data['numero_identificacion']
-        num_id = re.sub(r'[^\w-]', '', num_id)  # Conservar solo letras, números y guiones
-        extracted_data['numero_identificacion'] = num_id
+    Returns:
+        dict: {
+            'nombre_completo': str,
+            'nombre': str,
+            'apellidos': str,
+            'confidence': float,
+            'pattern_used': str
+        }
+    """
     
-    return extracted_data
+    if not text:
+        return None
+    
+    # Limpiar y normalizar texto
+    clean_text = normalize_text_for_extraction(text)
+    
+    # Intentar extracción específica por tipo de documento primero
+    if document_type:
+        result = extract_name_by_document_type(clean_text, document_type)
+        if result:
+            return result
+    
+    # Si no se especifica tipo o falla, intentar todos los patrones
+    return extract_name_with_all_patterns(clean_text)
 
-def validate_id_document_improved(extracted_data):
-    """Validación mejorada con criterios más específicos"""
-    validation = {
-        'is_valid': True,
-        'confidence': 0.8,  # Empezar con confianza alta
-        'errors': [],
-        'warnings': []
+def normalize_text_for_extraction(text):
+    """Normaliza el texto para mejor extracción"""
+    # Convertir a mayúsculas
+    text = text.upper()
+    
+    # Normalizar espacios múltiples
+    text = re.sub(r'\s+', ' ', text)
+    
+    # Limpiar caracteres problemáticos pero mantener estructura
+    text = re.sub(r'[^\w\s\-/]', ' ', text)
+    
+    return text.strip()
+
+def extract_name_by_document_type(text, document_type):
+    """Extrae nombres usando patrones específicos por tipo de documento"""
+    
+    if document_type in ['cedula_panama', 'cedula']:
+        return extract_name_cedula_panama(text)
+    elif document_type == 'pasaporte':
+        return extract_name_pasaporte(text)
+    elif document_type == 'dni':
+        return extract_name_dni_spain(text)
+    
+    return None
+
+def extract_name_cedula_panama(text):
+    """
+    Extracción ROBUSTA para cédulas panameñas.
+    Maneja TODOS los formatos observados en los ejemplos.
+    """
+    
+    # PATRONES ORDENADOS POR PRIORIDAD Y ESPECIFICIDAD
+    patterns = [
+        # Patrón 1: Formato estándar con TRIBUNAL ELECTORAL
+        {
+            'pattern': r'TRIBUNAL\s+ELECTORAL\s+([A-Z][A-Z\s]+?)\s+(?:NOMBRE\s+USUAL|FECHA\s+DE\s+NACIMIENTO)',
+            'name': 'tribunal_electoral_standard',
+            'confidence': 0.95
+        },
+        
+        # Patrón 2: ELECTORAL seguido de nombre
+        {
+            'pattern': r'ELECTORAL\s+([A-Z][A-Z\s]+?)\s+(?:NOMBRE\s+USUAL|FECHA)',
+            'name': 'electoral_simple',
+            'confidence': 0.90
+        },
+        
+        # Patrón 3: Formato con DOCUMENTO DE IDENTIDAD + número
+        {
+            'pattern': r'DOCUMENTO\s+DE\s+IDENTIDAD\s+\d+\s+([A-Z][A-Z\s]+?)\s+NOMBRE\s+USUAL',
+            'name': 'documento_identidad_numbered',
+            'confidence': 0.92
+        },
+        
+        # Patrón 4: Formato P A ... N A ... M (visto en ejemplos)
+        {
+            'pattern': r'P\s+A\s+([A-Z][A-Z\s]+?)\s+N\s+A\s+([A-Z][A-Z\s]+?)\s+M',
+            'name': 'format_p_a_n_a_m',
+            'confidence': 0.85,
+            'special_handler': 'handle_p_a_n_a_format'
+        },
+        
+        # Patrón 5: Nombre antes de NOMBRE USUAL (más flexible)
+        {
+            'pattern': r'([A-Z]{2,}(?:\s+[A-Z]{2,}){1,4})\s+NOMBRE\s+USUAL',
+            'name': 'before_nombre_usual',
+            'confidence': 0.80
+        },
+        
+        # Patrón 6: Entre PANAMA y NOMBRE USUAL
+        {
+            'pattern': r'PANAMA\s+([A-Z][A-Z\s]+?)\s+NOMBRE\s+USUAL',
+            'name': 'panama_to_nombre',
+            'confidence': 0.85
+        },
+        
+        # Patrón 7: Nombre seguido de cédula (formato alternativo)
+        {
+            'pattern': r'([A-Z]{2,}(?:\s+[A-Z]{2,}){1,4})\s+\d{1,2}-\d{3,4}-\d{1,4}',
+            'name': 'name_before_cedula',
+            'confidence': 0.75
+        },
+        
+        # Patrón 8: Captura entre palabras clave comunes
+        {
+            'pattern': r'(?:REPUBLICA\s+DE\s+PANAMA|TRIBUNAL|ELECTORAL)\s+.*?([A-Z]{2,}(?:\s+[A-Z]{2,}){1,4})\s+(?:NOMBRE|FECHA|LUGAR)',
+            'name': 'between_keywords',
+            'confidence': 0.70
+        }
+    ]
+    
+    for pattern_info in patterns:
+        try:
+            matches = re.finditer(pattern_info['pattern'], text)
+            
+            for match in matches:
+                if pattern_info.get('special_handler'):
+                    # Manejar patrones especiales
+                    if pattern_info['special_handler'] == 'handle_p_a_n_a_format':
+                        result = handle_p_a_n_a_format(match)
+                    else:
+                        continue
+                else:
+                    # Manejo estándar
+                    extracted_name = match.group(1).strip()
+                    result = validate_and_clean_name(extracted_name)
+                
+                if result:
+                    result['pattern_used'] = pattern_info['name']
+                    result['confidence'] = pattern_info['confidence']
+                    logger.info(f"✅ Nombre extraído con patrón '{pattern_info['name']}': {result['nombre_completo']}")
+                    return result
+                    
+        except Exception as e:
+            logger.warning(f"Error en patrón {pattern_info['name']}: {str(e)}")
+            continue
+    
+    logger.warning("❌ No se pudo extraer nombre con ningún patrón de cédula panameña")
+    return None
+
+def extract_name_pasaporte(text):
+    """Extracción ROBUSTA para pasaportes"""
+    
+    patterns = [
+        # Patrón 1: APELLIDOS/SURNAME ... NOMBRES/GIVEN NAMES
+        {
+            'pattern': r'(?:APELLIDOS|SURNAME)\s*[/]*\s*([A-Z\s]+?)\s+(?:NOMBRES|GIVEN\s+NAMES)\s*[/]*\s*([A-Z\s]+?)(?:\s+(?:SPECIMEN|FECHA|DATE|\d))',
+            'name': 'apellidos_nombres_format',
+            'confidence': 0.95,
+            'type': 'apellidos_nombres'
+        },
+        
+        # Patrón 2: SURNAME ... GIVEN NAMES (formato internacional)
+        {
+            'pattern': r'SURNAME\s+([A-Z\s]+?)\s+GIVEN\s+NAMES\s+([A-Z\s]+?)(?:\s+(?:SPECIMEN|DATE|\d))',
+            'name': 'surname_given_names',
+            'confidence': 0.90,
+            'type': 'apellidos_nombres'
+        },
+        
+        # Patrón 3: Línea MRZ (Machine Readable Zone)
+        {
+            'pattern': r'P<[A-Z]{3}([A-Z]+)<([A-Z<]+?)<<',
+            'name': 'mrz_format',
+            'confidence': 0.85,
+            'type': 'mrz',
+            'special_handler': 'handle_mrz_format'
+        },
+        
+        # Patrón 4: Nombre en línea específica de pasaporte
+        {
+            'pattern': r'(?:PASSPORT|PASAPORTE)\s+(?:NO|N[Oº])\s*[A-Z0-9]+\s*([A-Z\s]+?)(?:\s+(?:NATIONALITY|FECHA))',
+            'name': 'after_passport_number',
+            'confidence': 0.75
+        }
+    ]
+    
+    for pattern_info in patterns:
+        try:
+            match = re.search(pattern_info['pattern'], text)
+            if match:
+                if pattern_info.get('special_handler') == 'handle_mrz_format':
+                    result = handle_mrz_format(match)
+                elif pattern_info.get('type') == 'apellidos_nombres':
+                    # Formato apellidos/nombres
+                    apellidos = clean_name_component(match.group(1))
+                    nombres = clean_name_component(match.group(2))
+                    
+                    if apellidos and nombres:
+                        result = {
+                            'nombre_completo': f"{nombres} {apellidos}",
+                            'nombre': nombres,
+                            'apellidos': apellidos,
+                            'confidence': pattern_info['confidence'],
+                            'pattern_used': pattern_info['name']
+                        }
+                        logger.info(f"✅ Nombre de pasaporte extraído: {result['nombre_completo']}")
+                        return result
+                else:
+                    # Formato simple
+                    extracted_name = match.group(1).strip()
+                    result = validate_and_clean_name(extracted_name)
+                    if result:
+                        result['pattern_used'] = pattern_info['name']
+                        result['confidence'] = pattern_info['confidence']
+                        return result
+                        
+        except Exception as e:
+            logger.warning(f"Error en patrón de pasaporte {pattern_info['name']}: {str(e)}")
+            continue
+    
+    return None
+
+def extract_name_dni_spain(text):
+    """Extracción para DNI español"""
+    
+    patterns = [
+        {
+            'pattern': r'(?:NOMBRE|NAME)\s*[:\s]+([A-ZÁÉÍÓÚÑ\s]+?)(?:\s+(?:APELLIDOS|SURNAME|FECHA|DNI|\d))',
+            'name': 'nombre_field',
+            'confidence': 0.90
+        },
+        {
+            'pattern': r'(?:APELLIDOS|SURNAME)\s*[:\s]+([A-ZÁÉÍÓÚÑ\s]+?)(?:\s+(?:NOMBRE|NAME|FECHA|\d))',
+            'name': 'apellidos_field',
+            'confidence': 0.90
+        },
+        {
+            'pattern': r'(?:TITULAR|HOLDER)\s*[:\s]+([A-ZÁÉÍÓÚÑ\s]+?)(?:\s+(?:FECHA|DNI|\d))',
+            'name': 'titular_field',
+            'confidence': 0.85
+        }
+    ]
+    
+    for pattern_info in patterns:
+        try:
+            match = re.search(pattern_info['pattern'], text)
+            if match:
+                extracted_name = match.group(1).strip()
+                result = validate_and_clean_name(extracted_name)
+                if result:
+                    result['pattern_used'] = pattern_info['name']
+                    result['confidence'] = pattern_info['confidence']
+                    return result
+                    
+        except Exception as e:
+            logger.warning(f"Error en patrón DNI {pattern_info['name']}: {str(e)}")
+            continue
+    
+    return None
+
+def extract_name_with_all_patterns(text):
+    """Intenta todos los patrones disponibles como último recurso"""
+    
+    # Intentar patrones de cada tipo de documento
+    for doc_type in ['cedula_panama', 'pasaporte', 'dni']:
+        result = extract_name_by_document_type(text, doc_type)
+        if result:
+            result['pattern_used'] = f"fallback_{doc_type}"
+            result['confidence'] = max(0.5, result.get('confidence', 0.5) - 0.1)  # Reducir confianza
+            return result
+    
+    return None
+
+def handle_p_a_n_a_format(match):
+    """Maneja el formato especial P A ... N A ... M visto en cédulas"""
+    try:
+        # En este formato, los grupos suelen ser apellidos y nombres
+        apellidos = clean_name_component(match.group(1))
+        nombres = clean_name_component(match.group(2)) if len(match.groups()) > 1 else None
+        
+        if apellidos:
+            if nombres:
+                return {
+                    'nombre_completo': f"{nombres} {apellidos}",
+                    'nombre': nombres,
+                    'apellidos': apellidos
+                }
+            else:
+                return validate_and_clean_name(apellidos)
+    except:
+        pass
+    return None
+
+def handle_mrz_format(match):
+    """Maneja formato MRZ de pasaportes"""
+    try:
+        # En MRZ, < separa apellidos de nombres
+        apellidos_raw = match.group(1)
+        nombres_raw = match.group(2)
+        
+        # Limpiar < y convertir a espacios
+        apellidos = apellidos_raw.replace('<', ' ').strip()
+        nombres = nombres_raw.replace('<', ' ').strip()
+        
+        if apellidos and nombres:
+            return {
+                'nombre_completo': f"{nombres} {apellidos}",
+                'nombre': nombres,
+                'apellidos': apellidos
+            }
+    except:
+        pass
+    return None
+
+def validate_and_clean_name(name_text):
+    """
+    Valida y limpia un nombre extraído.
+    Retorna dict con nombre procesado o None si no es válido.
+    """
+    if not name_text or len(name_text.strip()) < 3:
+        return None
+    
+    # Limpiar el nombre
+    cleaned = clean_name_component(name_text)
+    
+    if not cleaned:
+        return None
+    
+    # Validar que parece un nombre real
+    if not is_valid_name(cleaned):
+        return None
+    
+    # Intentar separar nombres y apellidos si es posible
+    parts = cleaned.split()
+    
+    if len(parts) >= 4:
+        # Asumir que los primeros 2 son nombres y el resto apellidos
+        nombres = ' '.join(parts[:2])
+        apellidos = ' '.join(parts[2:])
+    elif len(parts) == 3:
+        # Asumir que el primero es nombre y el resto apellidos
+        nombres = parts[0]
+        apellidos = ' '.join(parts[1:])
+    elif len(parts) == 2:
+        # Asumir primer nombre y apellido
+        nombres = parts[0]
+        apellidos = parts[1]
+    else:
+        # Solo un componente
+        nombres = cleaned
+        apellidos = None
+    
+    return {
+        'nombre_completo': cleaned,
+        'nombre': nombres,
+        'apellidos': apellidos
     }
+
+def clean_name_component(text):
+    """Limpia un componente de nombre individual"""
+    if not text:
+        return None
     
-    # ==================== VALIDACIONES CRÍTICAS ====================
+    # Convertir a title case y limpiar
+    text = text.strip().title()
     
-    # 1. Tipo de documento
-    if not extracted_data.get('tipo_identificacion') or extracted_data['tipo_identificacion'] == 'desconocido':
-        validation['errors'].append("Tipo de documento no identificado")
-        validation['is_valid'] = False
-        validation['confidence'] -= 0.4
+    # Remover palabras no válidas
+    invalid_words = [
+        'Specimen', 'Muestra', 'Documento', 'Identidad', 'Tribunal', 
+        'Electoral', 'Republica', 'Panama', 'Passport', 'Pasaporte',
+        'Nombre', 'Usual', 'Fecha', 'Nacimiento', 'Apellidos', 'Surname',
+        'Given', 'Names', 'Authority', 'Autoridad'
+    ]
     
-    # 2. Número de identificación
-    if not extracted_data.get('numero_identificacion'):
-        validation['errors'].append("Número de identificación no encontrado")
-        validation['is_valid'] = False
-        validation['confidence'] -= 0.3
-    elif extracted_data['numero_identificacion'].startswith('AUTO-'):
-        validation['errors'].append("Número de identificación generado automáticamente")
-        validation['is_valid'] = False
-        validation['confidence'] -= 0.5
+    words = text.split()
+    clean_words = [w for w in words if w not in invalid_words and len(w) > 1]
     
-    # 3. Nombre completo
-    if not extracted_data.get('nombre_completo'):
-        validation['errors'].append("Nombre completo no encontrado")
-        validation['is_valid'] = False
-        validation['confidence'] -= 0.2
-    elif extracted_data['nombre_completo'] == 'Titular no identificado':
-        validation['errors'].append("Nombre genérico asignado")
-        validation['is_valid'] = False
-        validation['confidence'] -= 0.3
+    result = ' '.join(clean_words).strip()
+    return result if len(result) > 2 else None
+
+def is_valid_name(name):
+    """Valida que un texto parece ser un nombre real"""
+    if not name or len(name) < 3:
+        return False
     
-    # ==================== VALIDACIONES ESPECÍFICAS POR TIPO ====================
+    # Debe contener solo letras, espacios y algunos caracteres especiales
+    if not re.match(r'^[A-ZÁÉÍÓÚÑa-záéíóúñ\s\-\'\.]+$', name):
+        return False
     
-    doc_type = extracted_data.get('tipo_identificacion')
+    # Debe tener al menos una letra
+    if not re.search(r'[A-Za-z]', name):
+        return False
     
-    if doc_type == 'pasaporte':
-        # Validar formato número pasaporte
-        num_id = extracted_data.get('numero_identificacion', '')
-        if not re.match(r'^[A-Z]{2}\d{7}$', num_id):
-            validation['warnings'].append("Formato de número de pasaporte inusual")
-            validation['confidence'] -= 0.1
-        
-        # Los pasaportes deben tener autoridad de emisión
-        if not extracted_data.get('autoridad_emision'):
-            validation['warnings'].append("Autoridad de emisión no detectada")
-            validation['confidence'] -= 0.05
-        
-        # Validar país de emisión
-        if not extracted_data.get('pais_emision') or extracted_data['pais_emision'] == 'Desconocido':
-            validation['warnings'].append("País de emisión no identificado")
-            validation['confidence'] -= 0.1
+    # No debe ser todo mayúsculas de menos de 3 caracteres
+    words = name.split()
+    if len(words) < 1:
+        return False
     
-    elif doc_type == 'cedula_panama':
-        # Validar formato cédula panameña
-        num_id = extracted_data.get('numero_identificacion', '')
-        if not re.match(r'^\d{1,2}-\d{3,4}-\d{1,4}$', num_id):
-            validation['warnings'].append("Formato de cédula panameña incorrecto")
-            validation['confidence'] -= 0.2
-        
-        # País debe ser Panamá
-        if extracted_data.get('pais_emision') != 'Panamá':
-            validation['warnings'].append("País de emisión incorrecto para cédula panameña")
-            validation['confidence'] -= 0.1
+    # Cada palabra debe tener al menos 2 caracteres
+    if any(len(word) < 2 for word in words):
+        return False
     
-    elif doc_type == 'dni':
-        # Validar formato DNI español
-        num_id = extracted_data.get
+    # No debe contener números
+    if re.search(r'\d', name):
+        return False
+    
+    return True
+
+# Función de conveniencia para integración con código existente
+def extract_name_from_document(text, document_type=None):
+    """
+    Función de conveniencia que mantiene compatibilidad con código existente.
+    Retorna solo el nombre completo o None.
+    """
+    result = extract_name_universal(text, document_type)
+    return result['nombre_completo'] if result else None
 
 def lambda_handler(event, context):
     """
-    Función principal OPTIMIZADA para procesar documentos de identidad
+    Función principal CORREGIDA para procesar documentos de identidad
     """
     start_time = time.time()
     logger.info("="*80)
@@ -1312,7 +2091,7 @@ def lambda_handler(event, context):
             # Iniciar registro de procesamiento
             registro_id = log_document_processing_start(
                 document_id, 
-                'procesamiento_identidad_optimizado',
+                'procesamiento_identidad_corregido',
                 datos_entrada=message_body
             )
             
@@ -1345,8 +2124,8 @@ def lambda_handler(event, context):
                 analisis_id=registro_id
             )
             
-            # USAR LA FUNCIÓN MEJORADA
-            id_data = extract_id_document_data(extracted_text, entidades, metadatos)
+            # ✅ USAR FUNCIÓN CORREGIDA
+            id_data = extract_id_document_data_improved_core(extracted_text, entidades, metadatos)
             
             tipo_detectado = id_data.get('tipo_identificacion', 'desconocido')
             documento_detalle['tipo_detectado'] = tipo_detectado
@@ -1369,7 +2148,13 @@ def lambda_handler(event, context):
             validation = validate_id_document_improved(id_data)
             confidence = validation['confidence']
             
-            # Evaluar si requiere revisión manual
+            logger.info(f"📊 Validación completada - Confianza: {confidence:.2f}")
+            if validation['errors']:
+                logger.error(f"❌ Errores encontrados: {'; '.join(validation['errors'])}")
+            if validation['warnings']:
+                logger.warning(f"⚠️ Advertencias: {'; '.join(validation['warnings'])}")
+            
+            # ✅ EVALUACIÓN DE CONFIANZA CORREGIDA
             requires_review = evaluate_confidence(
                 confidence,
                 document_type=tipo_detectado,
@@ -1381,11 +2166,14 @@ def lambda_handler(event, context):
                 response['requieren_revision'] += 1
                 logger.warning(f"⚠️ Documento {document_id} requiere revisión manual")
                 
-                # Marcar para revisión manual
+                # ✅ MARCAR PARA REVISIÓN MANUAL CORREGIDO
                 try:
+                    # Necesitamos obtener el analysis_id correcto
+                    analysis_id = registro_id  # Usar el registro_id como analysis_id
+                    
                     mark_for_manual_review(
                         document_id=document_id,
-                        analysis_id=registro_id,
+                        analysis_id=analysis_id,
                         confidence=confidence,
                         document_type=tipo_detectado,
                         validation_info=validation,
@@ -1397,13 +2185,18 @@ def lambda_handler(event, context):
             # ==================== GUARDAR EN BASE DE DATOS ====================
             
             # Solo intentar guardar si tenemos datos mínimos válidos
+            #should_save = (
+            #    id_data.get('numero_identificacion') and 
+            #    not id_data['numero_identificacion'].startswith('AUTO-') and
+            #    id_data.get('nombre_completo') and 
+            #    id_data['nombre_completo'] != 'Titular no identificado'
+            #)
+            
             should_save = (
                 id_data.get('numero_identificacion') and 
-                not id_data['numero_identificacion'].startswith('AUTO-') and
-                id_data.get('nombre_completo') and 
-                id_data['nombre_completo'] != 'Titular no identificado'
+                not id_data['numero_identificacion'].startswith('AUTO-')
             )
-            
+
             if should_save:
                 logger.info(f"💾 Guardando datos extraídos en base de datos...")
                 
@@ -1418,7 +2211,7 @@ def lambda_handler(event, context):
                     analisis_id=registro_id
                 )
                 
-                # USAR LA FUNCIÓN MEJORADA DE REGISTRO
+                # ✅ USAR FUNCIÓN MEJORADA DE REGISTRO
                 success = register_document_identification_improved(document_id, id_data)
                 
                 if success:
@@ -1572,24 +2365,19 @@ def lambda_handler(event, context):
 
     # ==================== ASIGNAR CARPETA (SOLO SI HAY ÉXITOS) ====================
     
-    if response['procesados'] > 0:
-        try:
-            # Obtener último documento procesado exitosamente
-            last_success_doc = None
+        if response['procesados'] > 0 or response['requieren_revision'] > 0:
+            # Buscar CUALQUIER documento que haya sido procesado (exitoso o con revisión)
+            last_processed_doc = None
             for detalle in response['detalles']:
-                if detalle['estado'] in ['procesado', 'requiere_revision']:
-                    last_success_doc = detalle['documento_id']
+                if detalle['estado'] in ['procesado', 'requiere_revision', 'datos_insuficientes']:
+                    last_processed_doc = detalle['documento_id']
                     break
             
-            if last_success_doc:
-                cliente_id = get_client_id_by_document(last_success_doc)
+            if last_processed_doc:
+                cliente_id = get_client_id_by_document(last_processed_doc)
                 if cliente_id:
-                    logger.info(f"👤 Asignando carpeta para cliente {cliente_id}")
-                    assign_folder_and_link(cliente_id, last_success_doc)
-                else:
-                    logger.warning(f"⚠️ No se encontró cliente para documento {last_success_doc}")
-        except Exception as assign_error:
-            logger.error(f"❌ Error al asignar carpeta: {str(assign_error)}")
+                    logger.info(f"👤 Asignando carpeta para documento {last_processed_doc}")
+                    assign_folder_and_link(cliente_id, last_processed_doc)
     
     # ==================== RESUMEN FINAL ====================
     
@@ -1614,3 +2402,5 @@ def lambda_handler(event, context):
         'statusCode': 200,
         'body': json.dumps(response, ensure_ascii=False)
     }
+
+ 
