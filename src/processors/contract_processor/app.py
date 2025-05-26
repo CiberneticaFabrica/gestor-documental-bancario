@@ -367,22 +367,22 @@ def save_contract_data_to_db(document_id, contract_data, validation, operation_t
                 raise
 
         # Paso 3: Intentar vincular el documento con un cliente
-        try:
-            if contract_data.get('firmantes'):
-                for firmante in contract_data['firmantes']:
-                    if link_document_to_client(document_id, client_id=None, firmante=firmante):
-                        logger.info(f"Documento {document_id} vinculado a cliente mediante firmante: {firmante}")
-                        break
+        #try:
+        #    if contract_data.get('firmantes'):
+        #        for firmante in contract_data['firmantes']:
+        #            if link_document_to_client(document_id, client_id=None, firmante=firmante):
+        #                logger.info(f"Documento {document_id} vinculado a cliente mediante firmante: {firmante}")
+        #                break
 
-            if contract_data.get('numero_contrato') or contract_data.get('numero_producto'):
-                reference = contract_data.get('numero_contrato') or contract_data.get('numero_producto')
-                if link_document_to_client(document_id, client_id=None, reference=reference):
-                    logger.info(f"Documento {document_id} vinculado a cliente mediante referencia: {reference}")
+        #    if contract_data.get('numero_contrato') or contract_data.get('numero_producto'):
+        #        reference = contract_data.get('numero_contrato') or contract_data.get('numero_producto')
+        #        if link_document_to_client(document_id, client_id=None, reference=reference):
+        #            logger.info(f"Documento {document_id} vinculado a cliente mediante referencia: {reference}")
 
-            link_document_to_client(document_id)
+        #    link_document_to_client(document_id)
 
-        except Exception as link_error:
-            logger.warning(f"No se pudo vincular el documento a un cliente: {str(link_error)}")
+        #except Exception as link_error:
+        #    logger.warning(f"No se pudo vincular el documento a un cliente: {str(link_error)}")
 
         return {
             "success": True,

@@ -1,8 +1,8 @@
-# common/confidence_utils.py
+# common/confidence_utils.py - VERSIÓN CORREGIDA
 import os
 import logging
 import json
-from common.db_connector import update_analysis_record, log_document_processing_start, log_document_processing_end
+from common.db_connector import execute_query, log_document_processing_start, log_document_processing_end
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
@@ -39,9 +39,9 @@ def mark_for_manual_review(document_id, analysis_id, confidence,
             }
         )
         
-        # Actualizar registro de análisis
-        update_success = update_analysis_record(
-            document_id=document_id,
+        # ✅ CORRECCIÓN: Usar la función corregida
+        update_success = update_analysis_record_simple(
+            analysis_id=analysis_id,
             estado_analisis='requiere_revision',
             confianza_clasificacion=confidence,
             requiere_verificacion=True,
@@ -63,6 +63,54 @@ def mark_for_manual_review(document_id, analysis_id, confidence,
         
     except Exception as e:
         logger.error(f"Error al marcar documento {document_id} para revisión: {str(e)}")
+        return False
+
+# ✅ NUEVA FUNCIÓN AUXILIAR SIMPLIFICADA
+def update_analysis_record_simple(analysis_id, estado_analisis, confianza_clasificacion, 
+                                 requiere_verificacion, verificado, mensaje_error=None):
+    """
+    Función simplificada para actualizar solo los campos necesarios del análisis
+    """
+    try:
+        query = """
+        UPDATE analisis_documento_ia 
+        SET estado_analisis = %s,
+            confianza_clasificacion = %s,
+            requiere_verificacion = %s,
+            verificado = %s,
+            mensaje_error = %s,
+            fecha_analisis = NOW()
+        WHERE id_analisis = %s
+        """
+        
+        params = [
+            estado_analisis, 
+            confianza_clasificacion, 
+            requiere_verificacion, 
+            verificado, 
+            mensaje_error, 
+            analysis_id
+        ]
+        
+        # Ejecutar la actualización
+        execute_query(query, params, fetch=False)
+        
+        # Verificar si se actualizó algún registro
+        verify_query = """
+        SELECT COUNT(*) as count FROM analisis_documento_ia 
+        WHERE id_analisis = %s
+        """
+        verify_result = execute_query(verify_query, (analysis_id,))
+        
+        if not verify_result or verify_result[0]['count'] == 0:
+            logger.warning(f"No se encontró registro de análisis {analysis_id} para actualizar")
+            return False
+        
+        logger.info(f"Registro de análisis {analysis_id} actualizado correctamente")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error al actualizar análisis {analysis_id}: {str(e)}")
         return False
     
 def evaluate_confidence(confidence, document_type=None, validation_results=None):
@@ -118,6 +166,8 @@ def get_confidence_threshold(document_type=None):
     type_thresholds = {
         'dni': 0.80,
         'pasaporte': 0.80,
+        'cedula_panama': 0.75,
+        'cedula': 0.75,
         'contrato': 0.75,
         'extracto_bancario': 0.70,
         'nomina': 0.75,

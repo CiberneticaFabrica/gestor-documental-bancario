@@ -1,3 +1,4 @@
+# FIXED: src/textract_callback/app.py - Complete fixed version
 import os
 import json
 import boto3
@@ -35,7 +36,6 @@ CONTRACT_PROCESSOR_QUEUE_URL = os.environ.get('CONTRACT_PROCESSOR_QUEUE_URL')
 ID_PROCESSOR_QUEUE_URL = os.environ.get('ID_PROCESSOR_QUEUE_URL')
 FINANCIAL_PROCESSOR_QUEUE_URL = os.environ.get('FINANCIAL_PROCESSOR_QUEUE_URL')
 DEFAULT_PROCESSOR_QUEUE_URL = os.environ.get('DEFAULT_PROCESSOR_QUEUE_URL', DOCUMENT_CLASSIFIER_QUEUE_URL)
-PROCESSED_BUCKET = os.environ.get('PROCESSED_BUCKET')
 
 # Importar funciones necesarias
 try:
@@ -50,1066 +50,732 @@ try:
         generate_uuid,
         insert_analysis_record,
         log_document_processing_start,
-        log_document_processing_end
+        log_document_processing_end 
     )
     from common.validation import guess_document_type
     logger.info("Módulos importados correctamente")
 except ImportError as e:
     logger.error(f"Error importando módulos: {str(e)}")
 
-# ========== FUNCIONES NUEVAS PARA CORRECCIONES ==========
-def get_analysis_id_for_document(document_id, version_id=None):
+def extract_complete_data_from_textract_fixed(textract_results):
     """
-    Obtiene el analysis_id para un documento y versión específicos
+    VERSIÓN CORREGIDA: Extrae TODOS los datos de Textract de manera robusta
     """
+    start_time = time.time()
+    logger.info(f"🔄 Iniciando extracción completa de datos de Textract (versión corregida)")
+    
     try:
-        if version_id:
-            query = """
-            SELECT id_analisis FROM analisis_documento_ia 
-            WHERE id_documento = %s AND id_version = %s
-            ORDER BY fecha_analisis DESC LIMIT 1
-            """
-            result = execute_query(query, (document_id, version_id))
-        else:
-            query = """
-            SELECT id_analisis FROM analisis_documento_ia 
-            WHERE id_documento = %s
-            ORDER BY fecha_analisis DESC LIMIT 1
-            """
-            result = execute_query(query, (document_id,))
+        # 1. Validación de entrada
+        if not textract_results or not isinstance(textract_results, list):
+            logger.error("❌ Resultados de Textract inválidos o vacíos")
+            return create_empty_extraction_result()
         
-        return result[0]['id_analisis'] if result else None
-    except Exception as e:
-        logger.error(f"Error al obtener analysis_id: {str(e)}")
-        return None
-
-def create_analysis_record_for_version(document_id, version_id, analysis_id):
-    """
-    Crea un registro de análisis básico para una versión específica
-    """
-    try:
-        analysis_data = {
-            'id_analisis': analysis_id,
-            'id_documento': document_id,
-            'id_version': version_id,
-            'tipo_documento': 'documento',
-            'estado_analisis': 'iniciado',
-            'fecha_analisis': datetime.now().isoformat(),
-            'confianza_clasificacion': 0.5,
-            'texto_extraido': None,
-            'entidades_detectadas': None,
-            'metadatos_extraccion': json.dumps({'created_by': 'textract_callback'}),
-            'mensaje_error': None,
-            'version_modelo': 'textract-initial',
-            'tiempo_procesamiento': 0,
-            'procesado_por': 'textract_callback',
-            'requiere_verificacion': True,
-            'verificado': False,
-            'verificado_por': None,
-            'fecha_verificacion': None
+        # 2. Obtener todos los bloques de todas las páginas
+        all_blocks = []
+        page_count = 0
+        
+        for page_index, page in enumerate(textract_results):
+            if not isinstance(page, dict):
+                logger.warning(f"⚠️ Página {page_index} no es un diccionario válido")
+                continue
+                
+            page_blocks = page.get('Blocks', [])
+            if page_blocks:
+                all_blocks.extend(page_blocks)
+                page_count += 1
+                logger.debug(f"📄 Página {page_index}: {len(page_blocks)} bloques")
+        
+        logger.info(f"📊 Total procesado: {len(all_blocks)} bloques de {page_count} páginas")
+        
+        if not all_blocks:
+            logger.warning("⚠️ No se encontraron bloques en los resultados")
+            return create_empty_extraction_result()
+        
+        # 3. Metadata del documento
+        doc_metadata = {
+            'blocks_count': len(all_blocks),
+            'page_count': page_count,
+            'detection_time': textract_results[0].get('DetectDocumentTextModelVersion', 
+                                                     textract_results[0].get('DocumentMetadata', {}).get('Version', 'unknown')),
+            'extraction_timestamp': datetime.now().isoformat()
         }
         
-        insert_analysis_record(analysis_data)
-        return True
-    except Exception as e:
-        logger.error(f"Error al crear registro de análisis: {str(e)}")
-        return False
-
-def validate_document_version_consistency(document_id):
-    """
-    Valida que la consistencia entre documento, versiones y análisis sea correcta
-    """
-    try:
-        doc = get_document_by_id(document_id)
-        if not doc:
-            return False, f"Documento {document_id} no existe"
+        # 4. Extracción de texto completo
+        logger.debug("📝 Extrayendo texto completo...")
+        text_data = extract_text_from_blocks(all_blocks)
         
-        version_actual = doc.get('version_actual', 1)
-        version_id = get_version_id(document_id, version_actual)
-        if not version_id:
-            return False, f"Versión actual {version_actual} no existe"
+        # 5. Extracción de tablas
+        logger.debug("📋 Extrayendo tablas...")
+        tables_data = extract_tables_from_blocks(all_blocks)
         
-        return True, "Consistencia validada"
-    except Exception as e:
-        return False, f"Error en validación: {str(e)}"
-
-# ========== FUNCIONES AUXILIARES ORIGINALES ==========
-
-def get_document_id_from_job_tag(job_tag):
-    """Extrae el ID del documento desde el job tag"""
-    parts = job_tag.split('_')
-    if len(parts) > 0:
-        return parts[0]
-    return job_tag
-
-def get_document_type_from_job_tag(job_tag):
-    """Extrae el tipo de procesamiento desde el job tag"""
-    if '_contract_analysis' in job_tag:
-        return 'contract'
-    elif '_id_analysis' in job_tag:
-        return 'id'
-    elif '_financial_analysis' in job_tag:
-        return 'financial'
-    else:
-        return 'general'
-
-def get_textract_results(job_id, job_type='DOCUMENT_ANALYSIS'):
-    """Obtiene los resultados completos de Textract para un trabajo asíncrono"""
-    pages = []
-    start_time = time.time()
-    
-    try:
-        logger.info(f"Obteniendo resultados de Textract para job_id {job_id}, tipo {job_type}")
+        # 6. Extracción de formularios (key-value pairs)
+        logger.debug("📝 Extrayendo formularios...")
+        forms_data = extract_forms_from_blocks(all_blocks)
         
-        if job_type == 'DOCUMENT_ANALYSIS':
-            # Obtener la primera página de resultados
-            response = textract_client.get_document_analysis(JobId=job_id)
-            pages.append(response)
-            
-            # Obtener las páginas restantes si hay paginación
-            next_token = response.get('NextToken')
-            while next_token:
-                response = textract_client.get_document_analysis(
-                    JobId=job_id,
-                    NextToken=next_token
-                )
-                pages.append(response)
-                next_token = response.get('NextToken')
-                
-        elif job_type == 'DOCUMENT_TEXT_DETECTION':
-            # Obtener la primera página de resultados
-            response = textract_client.get_document_text_detection(JobId=job_id)
-            pages.append(response)
-            
-            # Obtener las páginas restantes si hay paginación
-            next_token = response.get('NextToken')
-            while next_token:
-                response = textract_client.get_document_text_detection(
-                    JobId=job_id,
-                    NextToken=next_token
-                )
-                pages.append(response)
-                next_token = response.get('NextToken')
+        # 7. Extracción de queries (si existen)
+        logger.debug("❓ Extrayendo queries...")
+        query_data = extract_query_answers_from_blocks(all_blocks)
         
-        logger.info(f"Resultados obtenidos: {len(pages)} páginas de respuesta")
+        # 8. Extracción de datos estructurados mediante patrones
+        logger.debug("🔍 Extrayendo datos estructurados...")
+        structured_data = extract_structured_patterns(text_data['full_text'])
+        
+        # 9. Clasificación del documento
+        logger.debug("🏷️ Clasificando documento...")
+        doc_type_info = guess_document_type(text_data['full_text'])
+        
+        # 10. Extracción de datos específicos según tipo
+        logger.debug("🎯 Extrayendo datos específicos...")
+        specific_data = extract_type_specific_data_safe(
+            text_data['full_text'], 
+            forms_data, 
+            structured_data, 
+            doc_type_info['document_type']
+        )
+        
+        # 11. Procesamiento de queries estructuradas
+        structured_query_data = process_query_answers_by_type_safe(query_data)
+        
+        # 12. Cálculo de confianza
+        extraction_confidence = calculate_overall_confidence(query_data, doc_type_info, text_data)
+        
+        # 13. Resultado final
         processing_time = time.time() - start_time
-        logger.info(f"Tiempo de obtención de resultados: {processing_time:.2f} segundos")
-        return pages, processing_time
+        
+        result = {
+            'metadata': doc_metadata,
+            'full_text': text_data['full_text'],
+            'text_blocks': text_data['blocks'],
+            'tables': tables_data,
+            'forms': forms_data,
+            'structured_data': structured_data,
+            'specific_data': specific_data,
+            'doc_type_info': doc_type_info,
+            'query_answers': query_data,
+            'structured_query_data': structured_query_data,
+            'extraction_confidence': extraction_confidence,
+            'processing_time': processing_time,
+            'extraction_success': True
+        }
+        
+        logger.info(f"✅ Extracción completa exitosa:")
+        logger.info(f"   - Tiempo: {processing_time:.2f}s")
+        logger.info(f"   - Texto: {len(text_data['full_text']):,} caracteres")
+        logger.info(f"   - Tablas: {len(tables_data)}")
+        logger.info(f"   - Formularios: {len(forms_data)} campos")
+        logger.info(f"   - Queries: {len(query_data)} respuestas")
+        logger.info(f"   - Confianza: {extraction_confidence:.2f}")
+        
+        return result
         
     except Exception as e:
-        logger.error(f"Error al obtener resultados de Textract: {str(e)}")
-        return [], 0
+        logger.error(f"❌ Error en extracción completa: {str(e)}")
+        import traceback
+        logger.error(f"📍 Stack trace: {traceback.format_exc()}")
+        
+        # Retornar resultado de error pero funcional
+        return create_error_extraction_result(str(e), time.time() - start_time)
 
-# ========== FUNCIÓN DE EXTRACCIÓN COMPLETA ==========
-def extract_complete_data_from_textract(textract_results):
-    """
-    Extrae TODOS los datos posibles de los resultados de Textract en un solo procesamiento.
-    Incluye texto, tablas, formularios, entidades y datos estructurados.
-    """
-    start_time = time.time()
-    logger.info(f"Iniciando extracción completa de datos de Textract")
-    
-    # 1. Preparación: Obtener todos los bloques de todas las páginas
-    all_blocks = []
-    for page in textract_results:
-        all_blocks.extend(page.get('Blocks', []))
-    
-    logger.info(f"Total de bloques obtenidos: {len(all_blocks)}")
-    
-    # Obtener metadata general
-    doc_metadata = {
-        'blocks_count': len(all_blocks),
-        'page_count': max([block.get('Page', 0) for block in all_blocks if 'Page' in block] or [0]),
-        'detection_time': textract_results[0].get('DetectDocumentTextModelVersion', 
-                                                 textract_results[0].get('DocumentMetadata', {}).get('Version', 'unknown'))
-    }
-    
-    # 2. Extracción de texto completo (incluye todo el texto del documento)
+def extract_text_from_blocks(all_blocks):
+    """Extrae texto de los bloques de manera robusta"""
     text_blocks = []
-    for block in all_blocks:
-        if block.get('BlockType') == 'LINE' and 'Text' in block:
-            # Guardar texto con información de página si está disponible
-            page_num = block.get('Page', 1)
-            confidence = block.get('Confidence', 0)
-            text = block.get('Text', '')
-            text_blocks.append({
-                'text': text,
-                'page': page_num,
-                'confidence': confidence,
-                'id': block.get('Id')
-            })
     
-    # Ordenar por página y crear texto completo
-    text_blocks.sort(key=lambda x: x['page'])
-    full_text = ' '.join([block['text'] for block in text_blocks])
-    
-    # 3. Extracción de tablas (todas las tablas con sus filas y columnas)
+    try:
+        for block in all_blocks:
+            if block.get('BlockType') == 'LINE' and 'Text' in block:
+                text_blocks.append({
+                    'text': block.get('Text', ''),
+                    'page': block.get('Page', 1),
+                    'confidence': block.get('Confidence', 0),
+                    'id': block.get('Id', '')
+                })
+        
+        # Ordenar por página
+        text_blocks.sort(key=lambda x: x['page'])
+        full_text = ' '.join([block['text'] for block in text_blocks if block['text'].strip()])
+        
+        return {
+            'full_text': full_text,
+            'blocks': text_blocks,
+            'character_count': len(full_text),
+            'line_count': len(text_blocks)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error extrayendo texto: {str(e)}")
+        return {
+            'full_text': '',
+            'blocks': [],
+            'character_count': 0,
+            'line_count': 0
+        }
+
+def extract_tables_from_blocks(all_blocks):
+    """Extrae tablas de los bloques de manera robusta"""
     tables = []
-    table_blocks = [block for block in all_blocks if block.get('BlockType') == 'TABLE']
     
-    for table_block in table_blocks:
-        table_id = table_block.get('Id')
-        page_num = table_block.get('Page', 1)
+    try:
+        table_blocks = [block for block in all_blocks if block.get('BlockType') == 'TABLE']
         
-        # Encontrar todas las celdas asociadas a esta tabla
-        cell_blocks = [
-            block for block in all_blocks 
-            if block.get('BlockType') == 'CELL' and 
-            any(rel.get('Type') == 'CHILD' and table_id in rel.get('Ids', [])
-                for rel in block.get('Relationships', []))
-        ]
-        
-        # Si no encontramos celdas usando la relación, buscar por relación inversa
-        if not cell_blocks:
+        for table_block in table_blocks:
+            table_id = table_block.get('Id')
+            page_num = table_block.get('Page', 1)
+            
+            # Encontrar celdas de la tabla
             cell_blocks = [
-                block for block in all_blocks
+                block for block in all_blocks 
                 if block.get('BlockType') == 'CELL' and block.get('Page') == page_num
             ]
+            
+            if cell_blocks:
+                table_data = process_table_cells(cell_blocks, all_blocks)
+                
+                if table_data:
+                    tables.append({
+                        'id': table_id,
+                        'page': page_num,
+                        'rows': len(table_data),
+                        'columns': len(table_data[0]) if table_data else 0,
+                        'data': table_data
+                    })
         
-        # Determinar tamaño de la tabla
-        if cell_blocks:
-            max_row = max([cell.get('RowIndex', 0) for cell in cell_blocks])
-            max_col = max([cell.get('ColumnIndex', 0) for cell in cell_blocks])
+        logger.debug(f"📋 {len(tables)} tablas extraídas")
+        return tables
+        
+    except Exception as e:
+        logger.error(f"Error extrayendo tablas: {str(e)}")
+        return []
+
+def process_table_cells(cell_blocks, all_blocks):
+    """Procesa las celdas de una tabla"""
+    try:
+        if not cell_blocks:
+            return []
+        
+        # Determinar dimensiones de la tabla
+        max_row = max([cell.get('RowIndex', 0) for cell in cell_blocks])
+        max_col = max([cell.get('ColumnIndex', 0) for cell in cell_blocks])
+        
+        if max_row == 0 or max_col == 0:
+            return []
+        
+        # Crear matriz vacía
+        table_data = []
+        for _ in range(max_row):
+            table_data.append([''] * max_col)
+        
+        # Rellenar celdas
+        for cell in cell_blocks:
+            row_idx = cell.get('RowIndex', 1) - 1
+            col_idx = cell.get('ColumnIndex', 1) - 1
             
-            # Crear matriz vacía para la tabla
-            table_data = []
-            for _ in range(max_row):
-                table_data.append([''] * max_col)
-            
-            # Rellenar la tabla con datos
-            for cell in cell_blocks:
-                row_idx = cell.get('RowIndex', 1) - 1
-                col_idx = cell.get('ColumnIndex', 1) - 1
+            if 0 <= row_idx < len(table_data) and 0 <= col_idx < len(table_data[row_idx]):
+                cell_text = extract_cell_text(cell, all_blocks)
+                table_data[row_idx][col_idx] = cell_text
+        
+        return table_data
+        
+    except Exception as e:
+        logger.error(f"Error procesando celdas: {str(e)}")
+        return []
+
+def extract_cell_text(cell, all_blocks):
+    """Extrae texto de una celda específica"""
+    try:
+        cell_text = ''
+        
+        # Buscar texto en relaciones CHILD
+        for rel in cell.get('Relationships', []):
+            if rel.get('Type') == 'CHILD':
+                child_ids = rel.get('Ids', [])
                 
-                # Obtener texto de la celda
-                cell_text = ''
+                word_blocks = [
+                    block for block in all_blocks
+                    if block.get('Id') in child_ids and block.get('BlockType') == 'WORD'
+                ]
                 
-                # Método 1: Obtener texto de relaciones de tipo CHILD
-                if 'Relationships' in cell:
-                    for rel in cell.get('Relationships', []):
-                        if rel.get('Type') == 'CHILD':
-                            child_ids = rel.get('Ids', [])
-                            
-                            # Encontrar bloques WORD dentro de la celda
-                            word_blocks = [
-                                block for block in all_blocks
-                                if block.get('Id') in child_ids and block.get('BlockType') == 'WORD'
-                            ]
-                            
-                            # Concatenar palabras
-                            if word_blocks:
-                                cell_text = ' '.join([word.get('Text', '') for word in word_blocks])
-                
-                # Método 2: Si no hay texto por relaciones, usar el texto directo si existe
-                if not cell_text and 'Text' in cell:
-                    cell_text = cell.get('Text', '')
-                
-                # Asignar texto a la celda en la matriz
-                if 0 <= row_idx < len(table_data) and 0 <= col_idx < len(table_data[row_idx]):
-                    table_data[row_idx][col_idx] = cell_text
-            
-            # Agregar la tabla procesada a la lista
-            tables.append({
-                'id': table_id,
-                'page': page_num,
-                'rows': max_row,
-                'columns': max_col,
-                'data': table_data
-            })
-    
-    # 4. Extracción de formularios (clave-valor)
+                if word_blocks:
+                    cell_text = ' '.join([word.get('Text', '') for word in word_blocks])
+                    break
+        
+        # Fallback: usar texto directo si existe
+        if not cell_text and 'Text' in cell:
+            cell_text = cell.get('Text', '')
+        
+        return cell_text.strip()
+        
+    except Exception as e:
+        logger.error(f"Error extrayendo texto de celda: {str(e)}")
+        return ''
+
+def extract_forms_from_blocks(all_blocks):
+    """Extrae formularios (key-value pairs) de manera robusta"""
     forms = {}
     
-    # Identificar bloques de tipo KEY_VALUE_SET
-    key_blocks = [
-        block for block in all_blocks
-        if block.get('BlockType') == 'KEY_VALUE_SET' and 
-        'EntityTypes' in block and 'KEY' in block.get('EntityTypes', [])
-    ]
-    
-    for key_block in key_blocks:
-        key_id = key_block.get('Id')
+    try:
+        key_blocks = [
+            block for block in all_blocks
+            if (block.get('BlockType') == 'KEY_VALUE_SET' and 
+                'EntityTypes' in block and 'KEY' in block.get('EntityTypes', []))
+        ]
         
-        # Obtener texto de la clave
-        key_text = ''
+        for key_block in key_blocks:
+            key_text = extract_key_text(key_block, all_blocks)
+            value_text = extract_value_text(key_block, all_blocks)
+            
+            if key_text and key_text.strip():
+                forms[key_text.strip()] = value_text.strip()
         
-        # Buscar por relaciones CHILD para encontrar palabras de la clave
+        logger.debug(f"📝 {len(forms)} campos de formulario extraídos")
+        return forms
+        
+    except Exception as e:
+        logger.error(f"Error extrayendo formularios: {str(e)}")
+        return {}
+
+def extract_key_text(key_block, all_blocks):
+    """Extrae texto de una clave"""
+    try:
         for rel in key_block.get('Relationships', []):
             if rel.get('Type') == 'CHILD':
                 child_ids = rel.get('Ids', [])
                 
-                # Obtener bloques WORD para la clave
                 key_words = [
                     block.get('Text', '') for block in all_blocks
                     if block.get('Id') in child_ids and block.get('BlockType') == 'WORD'
                 ]
                 
-                key_text = ' '.join(key_words)
+                if key_words:
+                    return ' '.join(key_words)
         
-        # Si no hay texto de clave, continuar
-        if not key_text:
-            continue
+        return ''
         
-        # Buscar el valor asociado a esta clave
-        value_text = ''
-        
-        # Obtener relaciones VALUE de la clave
-        value_ids = []
+    except Exception as e:
+        logger.error(f"Error extrayendo texto de clave: {str(e)}")
+        return ''
+
+def extract_value_text(key_block, all_blocks):
+    """Extrae texto del valor asociado a una clave"""
+    try:
+        # Buscar relaciones VALUE
         for rel in key_block.get('Relationships', []):
             if rel.get('Type') == 'VALUE':
-                value_ids.extend(rel.get('Ids', []))
-        
-        # Procesar cada bloque de valor
-        for value_id in value_ids:
-            value_block = next((b for b in all_blocks if b.get('Id') == value_id), None)
-            
-            if value_block:
-                # Obtener palabras del valor mediante relaciones CHILD
-                for rel in value_block.get('Relationships', []):
-                    if rel.get('Type') == 'CHILD':
-                        value_word_ids = rel.get('Ids', [])
-                        
-                        # Obtener bloques WORD para el valor
-                        value_words = [
-                            block.get('Text', '') for block in all_blocks
-                            if block.get('Id') in value_word_ids and block.get('BlockType') == 'WORD'
-                        ]
-                        
-                        value_text = ' '.join(value_words)
-        
-        # Guardar par clave-valor
-        key_text = key_text.strip()
-        value_text = value_text.strip()
-        
-        if key_text:
-            forms[key_text] = value_text
-    
-    # 5. Extracción de datos estructurados mediante patrones
-    # Detectar patrones comunes en documentos bancarios
-    
-    # Patrones de entidades clave
-    patterns = {
-        'dni': r'\b\d{8}[A-Za-z]?\b',
-        'passport': r'\b[A-Z]{1,2}[0-9]{6,7}\b',
-        'email': r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b',
-        'phone': r'\b(?:\+\d{1,3}\s?)?\(?\d{1,4}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b',
-        'iban': r'\b[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}([A-Z0-9]?){0,16}\b',
-        'credit_card': r'\b(?:\d[ -]*?){13,16}\b',
-        'dates': r'\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b',
-        'amounts': r'\b\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?\s*(?:€|EUR|USD|\$)?\b',
-        'percentages': r'\b\d{1,2}(?:[.,]\d{1,2})?\s*%\b'
-    }
-    
-    # Buscar coincidencias de patrones en el texto completo
-    structured_data = {}
-    for entity_type, pattern in patterns.items():
-        matches = re.findall(pattern, full_text)
-        if matches:
-            structured_data[entity_type] = matches
-    
-    # 6. Identificar tipo de documento basado en el contenido extraído
-    # Usar función de clasificación basada en contenido
-    doc_type_info = guess_document_type(full_text)
-    
-    # 7. Extraer información específica según tipo de documento
-    specific_data = extract_type_specific_data(full_text, forms, structured_data, doc_type_info['document_type'])
-    
-    # 8. Componer resultado final con TODOS los datos extraídos
-    result = {
-        'metadata': doc_metadata,
-        'full_text': full_text,
-        'text_blocks': text_blocks,
-        'tables': tables,
-        'forms': forms,
-        'structured_data': structured_data,
-        'specific_data': specific_data,
-        'doc_type_info': doc_type_info,
-        'processing_time': time.time() - start_time
-    }
-    
-    logger.info(f"Extracción completa finalizada. Tiempo total: {result['processing_time']:.2f} segundos")
-    logger.info(f"Datos extraídos: {len(full_text)} caracteres de texto, {len(tables)} tablas, {len(forms)} campos de formulario")
-    
-    return result
-
-def extract_type_specific_data(text, forms, structured_data, doc_type):
-    """
-    Extrae datos específicos según el tipo de documento.
-    Esta función centraliza la extracción de datos para cada tipo de documento específico.
-    """
-    result = {}
-    
-    # Procesar según tipo de documento
-    if doc_type == 'dni':
-        # Extraer datos específicos de DNI
-        result = extract_id_document_data(text, forms, structured_data)
-    
-    elif doc_type == 'pasaporte':
-        # Extraer datos específicos de pasaporte
-        result = extract_id_document_data(text, forms, structured_data, is_passport=True)
-    
-    elif doc_type in ['contrato', 'contrato_cuenta', 'contrato_tarjeta']:
-        # Extraer datos específicos de contratos
-        result = extract_contract_data(text, forms, structured_data)
-    
-    elif doc_type in ['extracto', 'extracto_bancario']:
-        # Extraer datos específicos de extractos bancarios
-        result = extract_financial_statement_data(text, forms, structured_data)
-    
-    elif doc_type in ['nomina', 'payroll']:
-        # Extraer datos específicos de nóminas
-        result = extract_payroll_data(text, forms, structured_data)
-    
-    elif doc_type in ['impuesto', 'declaracion_impuestos']:
-        # Extraer datos específicos de declaraciones de impuestos
-        result = extract_tax_data(text, forms, structured_data)
-    
-    # Otros tipos de documentos se añadirían aquí
-    
-    return result
-
-def extract_id_document_data(text, forms, structured_data, is_passport=False):
-    """Extrae información específica de documentos de identidad"""
-    data = {
-        'tipo_identificacion': 'pasaporte' if is_passport else 'dni',
-        'numero_identificacion': None,
-        'nombre_completo': None,
-        'fecha_nacimiento': None,
-        'fecha_emision': None,
-        'fecha_expiracion': None,
-        'pais_emision': None,
-        'genero': None
-    }
-    
-    # Buscar en formularios por campos relevantes (más confiable)
-    form_mappings = {
-        'nombre': ['nombre', 'apellidos', 'apellidos y nombre', 'name', 'full name', 'surname', 'given name'],
-        'numero': ['documento', 'número', 'dni', 'nie', 'nif', 'passport', 'passport no', 'número de documento'],
-        'emision': ['fecha de expedición', 'expedición', 'fecha emisión', 'date of issue', 'emisión'],
-        'caducidad': ['fecha de caducidad', 'caducidad', 'validez', 'válido hasta', 'date of expiry', 'expiry date'],
-        'nacimiento': ['fecha de nacimiento', 'nacimiento', 'date of birth', 'birth'],
-        'pais': ['país', 'nacionalidad', 'country', 'nationality', 'issuing country']
-    }
-    
-    # Buscar posibles claves en el formulario
-    for field, possible_keys in form_mappings.items():
-        for key in possible_keys:
-            for form_key in forms:
-                if key in form_key.lower():
-                    value = forms[form_key]
+                value_ids = rel.get('Ids', [])
+                
+                for value_id in value_ids:
+                    value_block = next((b for b in all_blocks if b.get('Id') == value_id), None)
                     
-                    if field == 'nombre' and not data['nombre_completo']:
-                        data['nombre_completo'] = value
-                    elif field == 'numero' and not data['numero_identificacion']:
-                        data['numero_identificacion'] = value
-                    elif field == 'emision' and not data['fecha_emision']:
-                        data['fecha_emision'] = normalize_date(value)
-                    elif field == 'caducidad' and not data['fecha_expiracion']:
-                        data['fecha_expiracion'] = normalize_date(value)
-                    elif field == 'nacimiento' and not data['fecha_nacimiento']:
-                        data['fecha_nacimiento'] = normalize_date(value)
-                    elif field == 'pais' and not data['pais_emision']:
-                        data['pais_emision'] = value
+                    if value_block:
+                        # Buscar palabras del valor
+                        for value_rel in value_block.get('Relationships', []):
+                            if value_rel.get('Type') == 'CHILD':
+                                value_word_ids = value_rel.get('Ids', [])
+                                
+                                value_words = [
+                                    block.get('Text', '') for block in all_blocks
+                                    if block.get('Id') in value_word_ids and block.get('BlockType') == 'WORD'
+                                ]
+                                
+                                if value_words:
+                                    return ' '.join(value_words)
+        
+        return ''
+        
+    except Exception as e:
+        logger.error(f"Error extrayendo texto de valor: {str(e)}")
+        return ''
+
+def extract_query_answers_from_blocks(all_blocks):
+    """Extrae respuestas de queries de manera robusta"""
+    query_answers = {}
     
-    # Si no tenemos datos de formularios, usar patrones en texto y datos estructurados
-    
-    # Número de documento
-    if not data['numero_identificacion']:
-        if is_passport and 'passport' in structured_data:
-            data['numero_identificacion'] = structured_data['passport'][0]
-        elif not is_passport and 'dni' in structured_data:
-            data['numero_identificacion'] = structured_data['dni'][0]
-    
-    # Fechas
-    if not data['fecha_emision'] or not data['fecha_expiracion']:
+    try:
+        query_blocks = [block for block in all_blocks if block.get('BlockType') == 'QUERY']
+        
+        for block in query_blocks:
+            query_id = block.get('Id')
+            query_text = block.get('Query', {}).get('Text', '')
+            query_alias = block.get('Query', {}).get('Alias', '')
+            
+            # Buscar respuesta
+            for rel in block.get('Relationships', []):
+                if rel.get('Type') == 'ANSWER':
+                    for answer_id in rel.get('Ids', []):
+                        answer_block = next(
+                            (b for b in all_blocks 
+                             if b.get('Id') == answer_id and b.get('BlockType') == 'QUERY_RESULT'), 
+                            None
+                        )
+                        
+                        if answer_block:
+                            answer_text = answer_block.get('Text', '')
+                            confidence = answer_block.get('Confidence', 0)
+                            
+                            key = query_alias or query_text
+                            query_answers[key] = {
+                                'question': query_text,
+                                'answer': answer_text,
+                                'confidence': confidence,
+                                'query_id': query_id
+                            }
+                            break
+        
+        logger.debug(f"❓ {len(query_answers)} queries respondidas")
+        return query_answers
+        
+    except Exception as e:
+        logger.error(f"Error extrayendo queries: {str(e)}")
+        return {}
+
+def extract_structured_patterns(text):
+    """Extrae patrones estructurados del texto"""
+    try:
+        patterns = {
+            'dni': r'\b\d{8}[A-Za-z]?\b',
+            'passport': r'\b[A-Z]{1,2}[0-9]{6,7}\b',
+            'email': r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b',
+            'phone': r'\b(?:\+\d{1,3}\s?)?\(?\d{1,4}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b',
+            'iban': r'\b[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}([A-Z0-9]?){0,16}\b',
+            'dates': r'\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b',
+            'amounts': r'\b\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?\s*(?:€|EUR|USD|\$)?\b',
+            'percentages': r'\b\d{1,2}(?:[.,]\d{1,2})?\s*%\b'
+        }
+        
+        structured_data = {}
+        for entity_type, pattern in patterns.items():
+            matches = re.findall(pattern, text)
+            if matches:
+                # Limpiar duplicados manteniendo orden
+                unique_matches = []
+                seen = set()
+                for match in matches:
+                    if match not in seen:
+                        unique_matches.append(match)
+                        seen.add(match)
+                structured_data[entity_type] = unique_matches
+        
+        logger.debug(f"🔍 Patrones extraídos: {list(structured_data.keys())}")
+        return structured_data
+        
+    except Exception as e:
+        logger.error(f"Error extrayendo patrones: {str(e)}")
+        return {}
+
+def extract_type_specific_data_safe(text, forms, structured_data, doc_type):
+    """Versión segura de extracción de datos específicos"""
+    try:
+        if doc_type in ['dni', 'pasaporte', 'cedula']:
+            return extract_id_document_data_safe(text, forms, structured_data, doc_type == 'pasaporte')
+        elif doc_type in ['contrato', 'contrato_cuenta', 'contrato_tarjeta']:
+            return extract_contract_data_safe(text, forms, structured_data)
+        else:
+            return extract_generic_data_safe(text, forms, structured_data)
+            
+    except Exception as e:
+        logger.error(f"Error en extracción específica: {str(e)}")
+        return {}
+
+def extract_id_document_data_safe(text, forms, structured_data, is_passport=False):
+    """Extracción segura de datos de documentos de identidad"""
+    try:
+        data = {
+            'tipo_identificacion': 'pasaporte' if is_passport else 'dni',
+            'numero_identificacion': None,
+            'nombre_completo': None,
+            'fecha_nacimiento': None,
+            'fecha_emision': None,
+            'fecha_expiracion': None,
+            'pais_emision': 'España',
+            'genero': None
+        }
+        
+        # Buscar en formularios primero (más confiable)
+        form_mappings = {
+            'nombre': ['nombre', 'apellidos', 'name', 'surname'],
+            'numero': ['documento', 'número', 'dni', 'passport'],
+            'emision': ['expedición', 'emisión', 'issue'],
+            'caducidad': ['caducidad', 'validez', 'expiry'],
+            'nacimiento': ['nacimiento', 'birth']
+        }
+        
+        for field, keywords in form_mappings.items():
+            for keyword in keywords:
+                for form_key in forms:
+                    if keyword.lower() in form_key.lower():
+                        value = forms[form_key]
+                        
+                        if field == 'nombre' and not data['nombre_completo']:
+                            data['nombre_completo'] = value
+                        elif field == 'numero' and not data['numero_identificacion']:
+                            data['numero_identificacion'] = value
+                        elif field == 'emision' and not data['fecha_emision']:
+                            data['fecha_emision'] = normalize_date_safe(value)
+                        elif field == 'caducidad' and not data['fecha_expiracion']:
+                            data['fecha_expiracion'] = normalize_date_safe(value)
+                        elif field == 'nacimiento' and not data['fecha_nacimiento']:
+                            data['fecha_nacimiento'] = normalize_date_safe(value)
+        
+        # Fallback a datos estructurados
+        if not data['numero_identificacion']:
+            if is_passport and 'passport' in structured_data:
+                data['numero_identificacion'] = structured_data['passport'][0]
+            elif not is_passport and 'dni' in structured_data:
+                data['numero_identificacion'] = structured_data['dni'][0]
+        
+        # Fallback para fechas
         if 'dates' in structured_data and len(structured_data['dates']) >= 2:
-            # Ordenar fechas encontradas
-            dates = [normalize_date(d) for d in structured_data['dates']]
-            valid_dates = [d for d in dates if d]  # Filtrar fechas nulas
+            dates = [normalize_date_safe(d) for d in structured_data['dates']]
+            valid_dates = [d for d in dates if d]
             
             if valid_dates:
                 valid_dates.sort()
-                
-                # Generalmente, la primera es emisión y la última expiración
                 if not data['fecha_emision'] and len(valid_dates) > 0:
                     data['fecha_emision'] = valid_dates[0]
-                
                 if not data['fecha_expiracion'] and len(valid_dates) > 1:
                     data['fecha_expiracion'] = valid_dates[-1]
-    
-    # Nombre completo (búsqueda en texto si no está en formularios)
-    if not data['nombre_completo']:
-        # Patrones comunes en documentos de identidad
-        nombre_patterns = [
-            r'APELLIDOS Y NOMBRE[:\s]+([A-ZÁÉÍÓÚÑ\s]+\s+[A-ZÁÉÍÓÚÑ\s]+)',
-            r'APELLIDOS?[:\s]+([A-ZÁÉÍÓÚÑ\s]+)\s+NOMBRES?[:\s]+([A-ZÁÉÍÓÚÑ\s]+)',
-            r'NOMBRE[:\s]+([A-ZÁÉÍÓÚÑ\s]+\s+[A-ZÁÉÍÓÚÑ\s]+)'
-        ]
         
-        for pattern in nombre_patterns:
-            matches = re.search(pattern, text.upper())
-            if matches:
-                if len(matches.groups()) == 1:
-                    data['nombre_completo'] = matches.group(1).strip()
-                    break
-                elif len(matches.groups()) == 2:
-                    data['nombre_completo'] = f"{matches.group(1).strip()} {matches.group(2).strip()}"
-                    break
-    
-    # País de emisión (si no está en formularios)
-    if not data['pais_emision']:
-        # Determinar por patrones comunes
-        spain_patterns = ['ESPAÑA', 'SPAIN', 'REINO DE ESPAÑA', 'KINGDOM OF SPAIN']
-        for pattern in spain_patterns:
-            if pattern in text.upper():
-                data['pais_emision'] = 'España'
-                break
+        return data
         
-        if not data['pais_emision']:
-            data['pais_emision'] = 'España'  # Valor por defecto
-    
-    return data
+    except Exception as e:
+        logger.error(f"Error en extracción de ID: {str(e)}")
+        return {}
 
-def extract_contract_data(text, forms, structured_data):
-    """Extrae información específica de contratos bancarios"""
-    data = {
-        'tipo_contrato': None,
-        'numero_contrato': None,
-        'fecha_contrato': None,
-        'partes': [],
-        'importe': None,
-        'tasa_interes': None,
-        'condiciones': [],
-        'fechas_clave': {}
-    }
-    
-    # Determinar tipo de contrato
-    contract_types = {
-        'cuenta': ['cuenta corriente', 'cuenta de ahorro', 'cuenta bancaria', 'apertura de cuenta'],
-        'tarjeta': ['tarjeta de crédito', 'tarjeta de débito', 'contrato de tarjeta'],
-        'prestamo': ['préstamo', 'préstamo personal', 'crédito', 'hipoteca'],
-        'inversion': ['inversión', 'fondo de inversión', 'plan de pensiones']
-    }
-    
-    for tipo, keywords in contract_types.items():
-        for keyword in keywords:
-            if keyword.lower() in text.lower():
+def extract_contract_data_safe(text, forms, structured_data):
+    """Extracción segura de datos de contratos"""
+    try:
+        data = {
+            'tipo_contrato': 'general',
+            'numero_contrato': None,
+            'fecha_contrato': None,
+            'partes': [],
+            'importe': None,
+            'tasa_interes': None
+        }
+        
+        # Determinar tipo de contrato
+        contract_keywords = {
+            'cuenta': ['cuenta corriente', 'cuenta de ahorro'],
+            'tarjeta': ['tarjeta de crédito', 'tarjeta de débito'],
+            'prestamo': ['préstamo', 'crédito', 'hipoteca']
+        }
+        
+        text_lower = text.lower()
+        for tipo, keywords in contract_keywords.items():
+            if any(keyword in text_lower for keyword in keywords):
                 data['tipo_contrato'] = tipo
                 break
-        if data['tipo_contrato']:
-            break
-    
-    # Si no se ha determinado, asignar tipo genérico
-    if not data['tipo_contrato']:
-        data['tipo_contrato'] = 'general'
-    
-    # Buscar número de contrato con patrones
-    contract_num_patterns = [
-        r'[Nn][úu]mero de [Cc]ontrato:?\s*([A-Z0-9-]+)',
-        r'[Cc]ontrato [Nn][úu]mero:?\s*([A-Z0-9-]+)',
-        r'[Rr]eferencia:?\s*([A-Z0-9-]+)',
-        r'[Nn][°º]\s*[Cc]ontrato:?\s*([A-Z0-9-]+)'
-    ]
-    
-    for pattern in contract_num_patterns:
-        match = re.search(pattern, text)
-        if match:
-            data['numero_contrato'] = match.group(1).strip()
-            break
-    
-    # Buscar fecha del contrato
-    date_patterns = [
-        r'[Ff]echa del [Cc]ontrato:?\s*(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4})',
-        r'[Ff]irmado el:?\s*(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4})',
-        r'[Ff]echa:?\s*(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4})'
-    ]
-    
-    for pattern in date_patterns:
-        match = re.search(pattern, text)
-        if match:
-            data['fecha_contrato'] = normalize_date(match.group(1))
-            break
-    
-    # Alternativa: usar fechas estructuradas
-    if not data['fecha_contrato'] and 'dates' in structured_data and structured_data['dates']:
-        # Usar la primera fecha encontrada como aproximación
-        data['fecha_contrato'] = normalize_date(structured_data['dates'][0])
-    
-    # Buscar importes/cantidades monetarias
-    if 'amounts' in structured_data and structured_data['amounts']:
-        # Usar el importe más grande como aproximación del valor del contrato
-        amounts = []
-        for amount_str in structured_data['amounts']:
-            # Normalizar y convertir a float
-            clean_amount = amount_str.replace('.', '').replace(',', '.').strip()
-            clean_amount = re.sub(r'[€$]', '', clean_amount).strip()
-            try:
-                amount = float(clean_amount)
-                amounts.append((amount, amount_str))
-            except ValueError:
-                continue
         
-        if amounts:
-            # Ordenar por valor y tomar el más alto
-            amounts.sort(key=lambda x: x[0], reverse=True)
-            data['importe'] = amounts[0][1]
-    
-    # Buscar tasas de interés
-    if 'percentages' in structured_data and structured_data['percentages']:
-        # Buscar patrones de interés
-        for i, percentage in enumerate(structured_data['percentages']):
-            if re.search(r'(inter[ée]s|tasa)', text.lower()[max(0, text.lower().find(percentage)-30):text.lower().find(percentage)]):
-                data['tasa_interes'] = percentage
+        # Buscar número de contrato
+        contract_patterns = [
+            r'[Nn]úmero de [Cc]ontrato:?\s*([A-Z0-9-]+)',
+            r'[Cc]ontrato [Nn]úmero:?\s*([A-Z0-9-]+)',
+            r'[Rr]eferencia:?\s*([A-Z0-9-]+)'
+        ]
+        
+        for pattern in contract_patterns:
+            match = re.search(pattern, text)
+            if match:
+                data['numero_contrato'] = match.group(1).strip()
                 break
         
-        # Si no encuentra, tomar el primer porcentaje
-        if not data['tasa_interes'] and structured_data['percentages']:
+        # Buscar fechas
+        if 'dates' in structured_data and structured_data['dates']:
+            data['fecha_contrato'] = normalize_date_safe(structured_data['dates'][0])
+        
+        # Buscar importes
+        if 'amounts' in structured_data and structured_data['amounts']:
+            amounts = []
+            for amount_str in structured_data['amounts']:
+                try:
+                    clean_amount = re.sub(r'[€$,.]', '', amount_str).strip()
+                    if clean_amount.isdigit():
+                        amounts.append((int(clean_amount), amount_str))
+                except:
+                    continue
+            
+            if amounts:
+                amounts.sort(key=lambda x: x[0], reverse=True)
+                data['importe'] = amounts[0][1]
+        
+        # Buscar tasa de interés
+        if 'percentages' in structured_data and structured_data['percentages']:
             data['tasa_interes'] = structured_data['percentages'][0]
-    
-    # Buscar partes del contrato (personas/entidades)
-    bank_patterns = [
-        r'(BANCO\s+[A-Z\s]+)',
-        r'([A-Z][a-z]+\s+BANK)',
-        r'(CAJA\s+[A-Z\s]+)'
-    ]
-    
-    for pattern in bank_patterns:
-        matches = re.findall(pattern, text.upper())
-        if matches:
-            data['partes'].append({'tipo': 'entidad', 'nombre': matches[0]})
-            break
-    
-    # Buscar persona (cliente)
-    person_patterns = [
-        r'(D\.|DON|DOÑA|Sr\.|Sra\.)\s+([A-ZÁÉÍÓÚÑ\s]+)',
-        r'CLIENTE:?\s+([A-ZÁÉÍÓÚÑ\s]+)'
-    ]
-    
-    for pattern in person_patterns:
-        matches = re.findall(pattern, text.upper())
-        if matches:
-            data['partes'].append({'tipo': 'cliente', 'nombre': matches[0][-1].strip()})
-            break
-    
-    return data
+        
+        return data
+        
+    except Exception as e:
+        logger.error(f"Error en extracción de contrato: {str(e)}")
+        return {}
 
-def extract_financial_statement_data(text, forms, structured_data):
-    """Extrae información específica de extractos bancarios"""
-    data = {
-        'entidad': None,
-        'numero_cuenta': None,
-        'titular': None,
-        'periodo': None,
-        'fecha_inicio': None,
-        'fecha_fin': None,
-        'saldo_inicial': None,
-        'saldo_final': None,
-        'movimientos': []
-    }
-    
-    # Buscar entidad bancaria
-    bank_patterns = [
-        r'(BANCO\s+[A-Z\s]+)',
-        r'([A-Z][a-z]+\s+BANK)',
-        r'(CAJA\s+[A-Z\s]+)'
-    ]
-    
-    for pattern in bank_patterns:
-        matches = re.findall(pattern, text.upper())
-        if matches:
-            data['entidad'] = matches[0]
-            break
-    
-    # Buscar número de cuenta (IBAN u otro formato)
-    if 'iban' in structured_data and structured_data['iban']:
-        data['numero_cuenta'] = structured_data['iban'][0]
-    else:
-        # Buscar otros formatos de cuenta
-        account_patterns = [
-            r'[Cc]uenta:?\s*(\d{4}\s*\d{4}\s*\d{2}\s*\d{10})',
-            r'[Cc]uenta:?\s*(\d{4}[- ]\d{4}[- ]\d{2}[- ]\d{4})',
-            r'[Nn][ºo°].?\s*[Cc]uenta:?\s*([A-Z0-9]+)'
-        ]
-        
-        for pattern in account_patterns:
-            match = re.search(pattern, text)
-            if match:
-                data['numero_cuenta'] = match.group(1).strip()
-                break
-    
-    # Buscar titular
-    holder_patterns = [
-        r'[Tt]itular:?\s+([A-ZÁÉÍÓÚÑ\s]+)',
-        r'[Cc]liente:?\s+([A-ZÁÉÍÓÚÑ\s]+)'
-    ]
-    
-    for pattern in holder_patterns:
-        match = re.search(pattern, text)
-        if match:
-            data['titular'] = match.group(1).strip()
-            break
-    
-    # Buscar período del extracto
-    period_patterns = [
-        r'[Pp]er[ií]odo:?\s+([^\.]+)',
-        r'[Ee]xtracto del:?\s+([^\.]+)',
-        r'[Dd]el\s+(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4})\s+[Aa]l\s+(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4})'
-    ]
-    
-    for pattern in period_patterns:
-        match = re.search(pattern, text)
-        if match:
-            # Si el patrón captura fechas inicio y fin
-            if len(match.groups()) == 2:
-                data['fecha_inicio'] = normalize_date(match.group(1))
-                data['fecha_fin'] = normalize_date(match.group(2))
-                data['periodo'] = f"Del {data['fecha_inicio']} al {data['fecha_fin']}"
-            else:
-                # Si captura el período completo
-                data['periodo'] = match.group(1).strip()
-                
-                # Intentar extraer fechas del período
-                dates_in_period = re.findall(r'\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}', data['periodo'])
-                if len(dates_in_period) >= 2:
-                    data['fecha_inicio'] = normalize_date(dates_in_period[0])
-                    data['fecha_fin'] = normalize_date(dates_in_period[-1])
-            
-            break
-    
-    # Si no se encontró período, usar fechas estructuradas
-    if not data['periodo'] and 'dates' in structured_data and len(structured_data['dates']) >= 2:
-        dates = [normalize_date(d) for d in structured_data['dates']]
-        valid_dates = [d for d in dates if d]
-        if len(valid_dates) >= 2:
-            valid_dates.sort()
-            data['fecha_inicio'] = valid_dates[0]
-            data['fecha_fin'] = valid_dates[-1]
-            data['periodo'] = f"Del {data['fecha_inicio']} al {data['fecha_fin']}"
-    
-    # Buscar saldos
-    balance_patterns = [
-        r'[Ss]aldo [Ii]nicial:?\s*([0-9.,]+)',
-        r'[Ss]aldo [Aa]nterior:?\s*([0-9.,]+)'
-    ]
-    
-    for pattern in balance_patterns:
-        match = re.search(pattern, text)
-        if match:
-            data['saldo_inicial'] = match.group(1).strip()
-            break
-    
-    final_balance_patterns = [
-        r'[Ss]aldo [Ff]inal:?\s*([0-9.,]+)',
-        r'[Ss]aldo [Aa]ctual:?\s*([0-9.,]+)',
-        r'[Ss]aldo [Dd]isponible:?\s*([0-9.,]+)'
-    ]
-    
-    for pattern in final_balance_patterns:
-        match = re.search(pattern, text)
-        if match:
-            data['saldo_final'] = match.group(1).strip()
-            break
-        
-    return data
-
-def extract_payroll_data(text, forms, structured_data):
-    """Extrae información específica de nóminas"""
-    data = {
-        'empresa': None,
-        'empleado': None,
-        'periodo': None,
-        'fecha_nomina': None,
-        'salario_base': None,
-        'deducciones': None,
-        'total_neto': None,
-        'conceptos': []
-    }
-    
-    # Buscar empresa
-    company_patterns = [
-        r'[Ee]mpresa:?\s+([A-ZÁÉÍÓÚÑ\s,\.]+)',
-        r'[Pp]agador:?\s+([A-ZÁÉÍÓÚÑ\s,\.]+)',
-        r'[Rr]az[óo]n [Ss]ocial:?\s+([A-ZÁÉÍÓÚÑ\s,\.]+)'
-    ]
-    
-    for pattern in company_patterns:
-        match = re.search(pattern, text)
-        if match:
-            data['empresa'] = match.group(1).strip()
-            break
-    
-    # Buscar empleado
-    employee_patterns = [
-        r'[Tt]rabajador:?\s+([A-ZÁÉÍÓÚÑ\s,\.]+)',
-        r'[Ee]mpleado:?\s+([A-ZÁÉÍÓÚÑ\s,\.]+)',
-        r'[Nn]ombre:?\s+([A-ZÁÉÍÓÚÑ\s,\.]+)'
-    ]
-    
-    for pattern in employee_patterns:
-        match = re.search(pattern, text)
-        if match:
-            data['empleado'] = match.group(1).strip()
-            break
-    
-    # Buscar período de la nómina
-    period_patterns = [
-        r'[Pp]er[íi]odo:?\s+([^\.]+)',
-        r'[Nn][óo]mina de:?\s+([^\.]+)',
-        r'[Cc]orrespondiente a:?\s+([^\.]+)',
-        r'[Mm]es:?\s+([A-Za-z]+)',
-        r'[Dd]el\s+(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4})\s+[Aa]l\s+(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4})'
-    ]
-    
-    for pattern in period_patterns:
-        match = re.search(pattern, text)
-        if match:
-            if len(match.groups()) == 2:
-                # Si captura fecha inicio y fin
-                from_date = normalize_date(match.group(1))
-                to_date = normalize_date(match.group(2))
-                data['periodo'] = f"Del {from_date} al {to_date}"
-            else:
-                data['periodo'] = match.group(1).strip()
-            break
-    
-    # Buscar fecha de la nómina
-    if 'dates' in structured_data and structured_data['dates']:
-        data['fecha_nomina'] = normalize_date(structured_data['dates'][0])
-    
-    # Buscar importes
-    if 'amounts' in structured_data and structured_data['amounts']:
-        # Ordenar por valor numérico (el más alto probablemente es el total)
-        amounts = []
-        for amount_str in structured_data['amounts']:
-            # Normalizar y convertir a float
-            clean_amount = amount_str.replace('.', '').replace(',', '.').strip()
-            clean_amount = re.sub(r'[€$]', '', clean_amount).strip()
-            try:
-                amount = float(clean_amount)
-                amounts.append((amount, amount_str))
-            except ValueError:
-                continue
-        
-        if amounts:
-            # Ordenar por valor
-            amounts.sort(key=lambda x: x[0], reverse=True)
-            
-            # El más alto probablemente es el total bruto o neto
-            # Buscar contexto alrededor de este importe
-            if len(amounts) > 0:
-                highest_amount = amounts[0][1]
-                index = text.find(highest_amount)
-                context = text[max(0, index-50):min(len(text), index+100)]
-                
-                # Verificar si es total neto o bruto
-                if re.search(r'(neto|líquido|a percibir)', context.lower()):
-                    data['total_neto'] = highest_amount
-                else:
-                    # Buscar específicamente total neto
-                    net_patterns = [
-                        r'([Tt]otal [Nn]eto|[Ll][íi]quido|[Aa] [Pp]ercibir):?\s*([0-9.,]+)',
-                        r'[Tt]otal [Aa] [Pp]ercibir:?\s*([0-9.,]+)'
-                    ]
-                    
-                    for pattern in net_patterns:
-                        match = re.search(pattern, text)
-                        if match:
-                            data['total_neto'] = match.group(1 if len(match.groups()) == 1 else 2).strip()
-                            break
-    
-    # Buscar salario base
-    base_patterns = [
-        r'([Ss]alario [Bb]ase|[Ss]ueldo [Bb]ase):?\s*([0-9.,]+)',
-        r'[Bb]ase:?\s*([0-9.,]+)'
-    ]
-    
-    for pattern in base_patterns:
-        match = re.search(pattern, text)
-        if match:
-            data['salario_base'] = match.group(1 if len(match.groups()) == 1 else 2).strip()
-            break
-    
-    # Buscar deducciones
-    deduction_patterns = [
-        r'([Tt]otal [Dd]educciones|[Dd]educciones):?\s*([0-9.,]+)',
-        r'[Dd]escuentos:?\s*([0-9.,]+)'
-    ]
-    
-    for pattern in deduction_patterns:
-        match = re.search(pattern, text)
-        if match:
-            data['deducciones'] = match.group(1 if len(match.groups()) == 1 else 2).strip()
-            break
-    
-    return data
-
-def extract_tax_data(text, forms, structured_data):
-    """Extrae información específica de declaraciones de impuestos"""
-    data = {
-        'tipo_impuesto': None,
-        'ejercicio': None,
-        'contribuyente': None,
-        'nif': None,
-        'resultado': None,
-        'a_ingresar': None,
-        'a_devolver': None
-    }
-    
-    # Determinar tipo de impuesto
-    tax_types = {
-        'irpf': ['irpf', 'impuesto sobre la renta', 'declaración de la renta', 'modelo 100'],
-        'iva': ['iva', 'impuesto sobre el valor añadido', 'modelo 303', 'modelo 390'],
-        'sociedades': ['impuesto sobre sociedades', 'modelo 200'],
-        'patrimonio': ['impuesto sobre el patrimonio', 'modelo 714']
-    }
-    
-    for tipo, keywords in tax_types.items():
-        for keyword in keywords:
-            if keyword.lower() in text.lower():
-                data['tipo_impuesto'] = tipo
-                break
-        if data['tipo_impuesto']:
-            break
-    
-    # Buscar ejercicio fiscal
-    year_patterns = [
-        r'[Ee]jercicio:?\s*(\d{4})',
-        r'[Aa]ño:?\s*(\d{4})',
-        r'[Pp]er[íi]odo:?\s*(\d{4})'
-    ]
-    
-    for pattern in year_patterns:
-        match = re.search(pattern, text)
-        if match:
-            data['ejercicio'] = match.group(1)
-            break
-    
-    # Si no se encuentra, buscar años en el texto
-    if not data['ejercicio']:
-        years = re.findall(r'\b(20\d{2})\b', text)
-        if years:
-            # Usar el año que más aparece
-            from collections import Counter
-            year_count = Counter(years)
-            data['ejercicio'] = year_count.most_common(1)[0][0]
-    
-    # Buscar contribuyente
-    taxpayer_patterns = [
-        r'[Cc]ontribuyente:?\s+([A-ZÁÉÍÓÚÑ\s,\.]+)',
-        r'[Dd]eclarante:?\s+([A-ZÁÉÍÓÚÑ\s,\.]+)',
-        r'[Aa]pellidos y [Nn]ombre:?\s+([A-ZÁÉÍÓÚÑ\s,\.]+)'
-    ]
-    
-    for pattern in taxpayer_patterns:
-        match = re.search(pattern, text)
-        if match:
-            data['contribuyente'] = match.group(1).strip()
-            break
-    
-    # Buscar NIF
-    if 'dni' in structured_data and structured_data['dni']:
-        data['nif'] = structured_data['dni'][0]
-    else:
-        nif_patterns = [
-            r'[Nn][Ii][Ff]:?\s*([0-9A-Z]{8,9})',
-            r'[Dd][Nn][Ii]:?\s*([0-9A-Z]{8,9})'
-        ]
-        
-        for pattern in nif_patterns:
-            match = re.search(pattern, text)
-            if match:
-                data['nif'] = match.group(1).strip()
-                break
-    
-    # Buscar resultado (a ingresar o devolver)
-    result_patterns = [
-        r'[Rr]esultado:?\s*([0-9.,]+)',
-        r'[Cc]uota [Rr]esultante:?\s*([0-9.,]+)',
-        r'[Rr]esultado de la [Dd]eclaración:?\s*([0-9.,]+)'
-    ]
-    
-    for pattern in result_patterns:
-        match = re.search(pattern, text)
-        if match:
-            data['resultado'] = match.group(1).strip()
-            break
-    
-    # Buscar a ingresar
-    pay_patterns = [
-        r'[Aa] [Ii]ngresar:?\s*([0-9.,]+)',
-        r'[Ii]mporte a [Ii]ngresar:?\s*([0-9.,]+)'
-    ]
-    
-    for pattern in pay_patterns:
-        match = re.search(pattern, text)
-        if match:
-            data['a_ingresar'] = match.group(1).strip()
-            break
-    
-    # Buscar a devolver
-    refund_patterns = [
-        r'[Aa] [Dd]evolver:?\s*([0-9.,]+)',
-        r'[Ii]mporte a [Dd]evolver:?\s*([0-9.,]+)'
-    ]
-    
-    for pattern in refund_patterns:
-        match = re.search(pattern, text)
-        if match:
-            data['a_devolver'] = match.group(1).strip()
-            break
-    
-    return data
-
-def normalize_date(date_str):
-    """Normaliza un string de fecha a formato ISO (YYYY-MM-DD)"""
-    if not date_str:
-        return None
-        
+def extract_generic_data_safe(text, forms, structured_data):
+    """Extracción segura de datos genéricos"""
     try:
-        # Eliminar caracteres no numéricos excepto separadores
+        return {
+            'texto_resumen': text[:500] if text else '',
+            'campos_formulario': len(forms),
+            'entidades_encontradas': list(structured_data.keys()),
+            'tipo_contenido': 'documento_generico'
+        }
+    except Exception as e:
+        logger.error(f"Error en extracción genérica: {str(e)}")
+        return {}
+
+def normalize_date_safe(date_str):
+    """Normalización segura de fechas"""
+    try:
+        if not date_str or not isinstance(date_str, str):
+            return None
+        
         clean_date = re.sub(r'[^\d/.-]', '', date_str)
         
-        # Detectar formato
         if re.match(r'\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}', clean_date):
-            # Formato DD/MM/YYYY o DD/MM/YY
             parts = re.split(r'[/.-]', clean_date)
-            
-            day = int(parts[0])
-            month = int(parts[1])
-            year = int(parts[2])
-            
-            # Ajustar año si es de dos dígitos
-            if year < 100:
-                if year < 50:  # Heurística: asumimos que años < 50 son 20XX
-                    year += 2000
-                else:
-                    year += 1900
-            
-            return f"{year:04d}-{month:02d}-{day:02d}"
-            
-        elif re.match(r'\d{4}[/.-]\d{1,2}[/.-]\d{1,2}', clean_date):
-            # Formato YYYY/MM/DD
-            parts = re.split(r'[/.-]', clean_date)
-            
-            year = int(parts[0])
-            month = int(parts[1])
-            day = int(parts[2])
-            
-            return f"{year:04d}-{month:02d}-{day:02d}"
-            
-        else:
-            return None
-            
-    except (ValueError, IndexError):
+            if len(parts) == 3:
+                day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
+                
+                if year < 100:
+                    year += 2000 if year < 50 else 1900
+                
+                if 1 <= day <= 31 and 1 <= month <= 12 and 1900 <= year <= 2100:
+                    return f"{year:04d}-{month:02d}-{day:02d}"
+        
         return None
+        
+    except Exception:
+        return None
+
+def process_query_answers_by_type_safe(query_answers):
+    """Procesamiento seguro de respuestas de queries"""
+    try:
+        structured_data = {
+            'contract_info': {},
+            'parties': {},
+            'financial_terms': {},
+            'guarantees': {},
+            'personal_info': {}
+        }
+        
+        field_mapping = {
+            'numero_contrato': ('contract_info', 'contract_number'),
+            'nombre_prestatario': ('parties', 'borrower_name'),
+            'cedula_prestatario': ('parties', 'borrower_id'),
+            'monto_prestamo': ('financial_terms', 'loan_amount'),
+            'tasa_interes': ('financial_terms', 'interest_rate'),
+            'cuota_mensual': ('financial_terms', 'monthly_payment'),
+            'nombre_completo': ('personal_info', 'full_name'),
+            'numero_documento': ('personal_info', 'document_number'),
+            'fecha_contrato': ('contract_info', 'contract_date'),
+            'nombre_banco': ('parties', 'bank_name')
+        }
+        
+        for alias, answer_data in query_answers.items():
+            if alias in field_mapping:
+                category, field = field_mapping[alias]
+                
+                clean_answer = clean_query_answer_safe(answer_data['answer'])
+                if clean_answer:
+                    structured_data[category][field] = {
+                        'value': clean_answer,
+                        'confidence': answer_data['confidence'],
+                        'raw_answer': answer_data['answer']
+                    }
+        
+        return structured_data
+        
+    except Exception as e:
+        logger.error(f"Error procesando queries: {str(e)}")
+        return {}
+
+def clean_query_answer_safe(raw_answer):
+    """Limpieza segura de respuestas de queries"""
+    try:
+        if not raw_answer or not isinstance(raw_answer, str):
+            return None
+        
+        # Limpiar respuestas "no encontrado"
+        no_answer_patterns = ['not found', 'no encontrado', 'n/a', 'none', '']
+        cleaned = raw_answer.strip().lower()
+        
+        if cleaned in no_answer_patterns or len(cleaned) < 2:
+            return None
+        
+        return raw_answer.strip()
+        
+    except Exception:
+        return None
+
+def calculate_overall_confidence(query_data, doc_type_info, text_data):
+    """Calcula confianza general de la extracción"""
+    try:
+        confidences = []
+        
+        # Confianza de clasificación
+        if doc_type_info and 'confidence' in doc_type_info:
+            confidences.append(doc_type_info['confidence'])
+        
+        # Confianza de queries
+        if query_data:
+            query_confidences = [
+                data['confidence'] for data in query_data.values() 
+                if data.get('answer') and data['answer'].strip()
+            ]
+            if query_confidences:
+                confidences.append(sum(query_confidences) / len(query_confidences) / 100)
+        
+        # Confianza basada en cantidad de texto
+        text_length = len(text_data.get('full_text', ''))
+        if text_length > 1000:
+            confidences.append(0.9)
+        elif text_length > 500:
+            confidences.append(0.7)
+        elif text_length > 100:
+            confidences.append(0.5)
+        else:
+            confidences.append(0.3)
+        
+        if confidences:
+            return sum(confidences) / len(confidences)
+        else:
+            return 0.5
+            
+    except Exception as e:
+        logger.error(f"Error calculando confianza: {str(e)}")
+        return 0.5
+
+def create_empty_extraction_result():
+    """Crea un resultado vacío pero válido"""
+    return {
+        'metadata': {'blocks_count': 0, 'page_count': 0, 'detection_time': 'unknown'},
+        'full_text': '',
+        'text_blocks': [],
+        'tables': [],
+        'forms': {},
+        'structured_data': {},
+        'specific_data': {},
+        'doc_type_info': {'document_type': 'unknown', 'confidence': 0.0},
+        'query_answers': {},
+        'structured_query_data': {},
+        'extraction_confidence': 0.0,
+        'processing_time': 0.0,
+        'extraction_success': False
+    }
+
+def create_error_extraction_result(error_message, processing_time):
+    """Crea un resultado de error pero funcional"""
+    result = create_empty_extraction_result()
+    result.update({
+        'error_message': error_message,
+        'processing_time': processing_time,
+        'extraction_success': False
+    })
+    return result
 
 def determine_processor_queue(doc_type):
     """Determina la cola SQS apropiada según el tipo de documento"""
-    
-    # Mapeo de tipos de documento a colas
     queue_mapping = {
         'dni': ID_PROCESSOR_QUEUE_URL,
         'pasaporte': ID_PROCESSOR_QUEUE_URL,
+        'cedula': ID_PROCESSOR_QUEUE_URL,
         'contrato': CONTRACT_PROCESSOR_QUEUE_URL,
         'contrato_cuenta': CONTRACT_PROCESSOR_QUEUE_URL,
         'contrato_tarjeta': CONTRACT_PROCESSOR_QUEUE_URL,
@@ -1119,365 +785,410 @@ def determine_processor_queue(doc_type):
         'impuesto': FINANCIAL_PROCESSOR_QUEUE_URL
     }
     
-    # Buscar cola específica o usar default
     for key, queue in queue_mapping.items():
         if doc_type.lower() == key or doc_type.lower().startswith(key):
-            return queue
+            return queue or DEFAULT_PROCESSOR_QUEUE_URL
     
-    # Si no hay coincidencia, usar la cola por defecto
     return DEFAULT_PROCESSOR_QUEUE_URL
+
+def get_document_id_from_job_tag(job_tag):
+    """Extrae el ID del documento desde el job tag"""
+    try:
+        if not job_tag:
+            return None
+        
+        parts = job_tag.split('_')
+        if len(parts) > 0:
+            return parts[0]
+        
+        return job_tag
+        
+    except Exception as e:
+        logger.error(f"Error extrayendo document_id: {str(e)}")
+        return None
+
+def get_textract_results_safe(job_id, job_type='DOCUMENT_ANALYSIS'):
+    """Obtiene resultados de Textract de manera segura"""
+    pages = []
+    start_time = time.time()
+    
+    try:
+        logger.info(f"🔄 Obteniendo resultados de Textract: JobId={job_id}, Tipo={job_type}")
+        
+        max_pages = 50  # Límite de seguridad
+        page_count = 0
+        
+        if job_type == 'DOCUMENT_ANALYSIS':
+            response = textract_client.get_document_analysis(JobId=job_id)
+            pages.append(response)
+            page_count += 1
+            
+            next_token = response.get('NextToken')
+            while next_token and page_count < max_pages:
+                response = textract_client.get_document_analysis(
+                    JobId=job_id,
+                    NextToken=next_token
+                )
+                pages.append(response)
+                page_count += 1
+                next_token = response.get('NextToken')
+                
+        elif job_type == 'DOCUMENT_TEXT_DETECTION':
+            response = textract_client.get_document_text_detection(JobId=job_id)
+            pages.append(response)
+            page_count += 1
+            
+            next_token = response.get('NextToken')
+            while next_token and page_count < max_pages:
+                response = textract_client.get_document_text_detection(
+                    JobId=job_id,
+                    NextToken=next_token
+                )
+                pages.append(response)
+                page_count += 1
+                next_token = response.get('NextToken')
+        
+        processing_time = time.time() - start_time
+        logger.info(f"✅ Resultados obtenidos: {page_count} páginas en {processing_time:.2f}s")
+        
+        return pages, processing_time
+        
+    except Exception as e:
+        logger.error(f"❌ Error obteniendo resultados: {str(e)}")
+        return [], time.time() - start_time
+
+def validate_document_version_consistency(document_id):
+    """
+    Valida la consistencia entre documento y versiones
+    """
+    try:
+        # Obtener información del documento
+        doc_query = """
+        SELECT id_documento, version_actual 
+        FROM documentos 
+        WHERE id_documento = %s
+        """
+        doc_result = execute_query(doc_query, (document_id,))
+        
+        if not doc_result:
+            return False, "Documento no encontrado"
+        
+        version_actual = doc_result[0]['version_actual']
+        
+        # Verificar que la versión actual existe
+        version_query = """
+        SELECT id_version 
+        FROM versiones_documento 
+        WHERE id_documento = %s AND numero_version = %s
+        """
+        version_result = execute_query(version_query, (document_id, version_actual))
+        
+        if not version_result:
+            return False, f"Versión actual {version_actual} no encontrada"
+        
+        return True, f"Consistencia validada para documento {document_id}, versión {version_actual}"
+        
+    except Exception as e:
+        logger.error(f"Error validando consistencia: {str(e)}")
+        return False, str(e)
+
+def get_analysis_id_for_document(document_id, version_id=None):
+    """
+    Obtiene el analysis_id existente para un documento/versión
+    """
+    try:
+        if version_id:
+            query = """
+            SELECT id_analisis FROM analisis_documento_ia 
+            WHERE id_documento = %s AND id_version = %s
+            ORDER BY fecha_analisis DESC 
+            LIMIT 1
+            """
+            result = execute_query(query, (document_id, version_id))
+        else:
+            query = """
+            SELECT id_analisis FROM analisis_documento_ia 
+            WHERE id_documento = %s
+            ORDER BY fecha_analisis DESC 
+            LIMIT 1
+            """
+            result = execute_query(query, (document_id,))
+        
+        if result:
+            return result[0]['id_analisis']
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error obteniendo analysis_id: {str(e)}")
+        return None
+
+def create_analysis_record_for_version(document_id, version_id, analysis_id):
+    """
+    Crea un registro de análisis básico para una versión
+    """
+    try:
+        analysis_data = {
+            'id_analisis': analysis_id,
+            'id_documento': document_id,
+            'id_version': version_id,
+            'tipo_documento': 'documento',
+            'confianza_clasificacion': 0.5,
+            'texto_extraido': None,
+            'entidades_detectadas': None,
+            'metadatos_extraccion': json.dumps({'created_for': 'pypdf2_processing'}),
+            'fecha_analisis': datetime.now().isoformat(),
+            'estado_analisis': 'iniciado',
+            'mensaje_error': None,
+            'version_modelo': 'pypdf2-basic',
+            'tiempo_procesamiento': 0,
+            'procesado_por': 'upload_processor',
+            'requiere_verificacion': True,
+            'verificado': False,
+            'verificado_por': None,
+            'fecha_verificacion': None
+        }
+        
+        insert_analysis_record(analysis_data)
+        logger.info(f"Registro de análisis creado: {analysis_id}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error creando registro de análisis: {str(e)}")
+        return False
+
 
 def lambda_handler(event, context):
     """
-    Función que maneja las notificaciones de finalización de Textract.
-    VERSIÓN CORREGIDA con manejo adecuado de versiones.
+    FUNCIÓN PRINCIPAL CORREGIDA: Maneja callbacks de Textract de manera robusta
     """
-    # Registrar inicio del procesamiento
     callback_registro_id = log_document_processing_start(
-        'textract_callback',
-        'procesar_callback_textract',
+        'textract_callback_robusto',
+        'procesar_callback_textract_v2',
         datos_entrada={"sns_records": len(event.get('Records', []))}
     )
     
     try:
-        logger.info(f"Evento recibido: {json.dumps(event)}")
+        logger.info(f"📨 Callback de Textract recibido")
+        
+        # Validar estructura del evento
+        if not event.get('Records') or len(event['Records']) == 0:
+            raise ValueError("Evento SNS inválido o vacío")
         
         # Extraer mensaje SNS
-        sns_message = event['Records'][0]['Sns']['Message']
+        sns_record = event['Records'][0]
+        if 'Sns' not in sns_record or 'Message' not in sns_record['Sns']:
+            raise ValueError("Estructura de mensaje SNS inválida")
+        
+        sns_message = sns_record['Sns']['Message']
         message_json = json.loads(sns_message)
         
-        job_id = message_json['JobId']
-        status = message_json['Status']
+        # Extraer información del job
+        job_id = message_json.get('JobId')
+        status = message_json.get('Status')
         job_tag = message_json.get('JobTag', '')
         
-        logger.info(f"Notificación de Textract: JobId={job_id}, Status={status}, JobTag={job_tag}")
+        if not job_id or not status:
+            raise ValueError(f"JobId o Status faltantes en el mensaje: {message_json}")
         
-        # Extraer ID del documento y tipo de análisis del JobTag
+        logger.info(f"📋 Job procesado: JobId={job_id}, Status={status}, JobTag={job_tag}")
+        
+        # Extraer document_id del job_tag
         document_id = get_document_id_from_job_tag(job_tag)
-        doc_type = get_document_type_from_job_tag(job_tag)
+        if not document_id:
+            raise ValueError(f"No se pudo extraer document_id del JobTag: {job_tag}")
         
-        # Registrar procesamiento específico del documento
+        # Registrar procesamiento del documento específico
         doc_registro_id = log_document_processing_start(
             document_id,
-            'callback_textract_documento',
-            datos_entrada={"job_id": job_id, "status": status, "job_tag": job_tag},
+            'callback_documento_especifico',
+            datos_entrada={"job_id": job_id, "status": status},
             analisis_id=callback_registro_id
         )
         
-        # Determinar tipo de trabajo
-        job_type = 'DOCUMENT_ANALYSIS'  # Por defecto
-        if '_textract_detection' in job_tag:
-            job_type = 'DOCUMENT_TEXT_DETECTION'
-        
         if status == 'SUCCEEDED':
-            # CORRECCIÓN 1: Validar consistencia del documento antes de proceder
-            consistency_check_id = log_document_processing_start(
-                document_id,
-                'validar_consistencia_version',
-                datos_entrada={"job_id": job_id},
-                analisis_id=doc_registro_id
-            )
+            logger.info(f"✅ Procesamiento exitoso para documento {document_id}")
             
-            is_consistent, consistency_message = validate_document_version_consistency(document_id)
+            # Validar consistencia del documento
+            consistency_valid, consistency_msg = validate_document_version_consistency(document_id)
+            if not consistency_valid:
+                logger.warning(f"⚠️ Inconsistencia detectada: {consistency_msg}")
             
-            log_document_processing_end(
-                consistency_check_id,
-                estado='completado' if is_consistent else 'advertencia',
-                mensaje_error=None if is_consistent else consistency_message,
-                datos_procesados={"consistent": is_consistent}
-            )
-            
-            if not is_consistent:
-                logger.warning(f"Inconsistencia detectada: {consistency_message}")
-            
-            # CORRECCIÓN 2: Obtener información completa del documento
+            # Obtener información del documento
             doc_info = get_document_by_id(document_id)
             if not doc_info:
-                logger.error(f"No se encontró el documento {document_id}")
-                
-                log_document_processing_end(
-                    doc_registro_id,
-                    estado='error',
-                    mensaje_error=f"Documento {document_id} no encontrado"
-                )
-                
-                return {
-                    'statusCode': 404,
-                    'body': json.dumps({'error': 'Documento no encontrado'})
-                }
+                raise ValueError(f"Documento {document_id} no encontrado en base de datos")
             
-            # CORRECCIÓN 3: Obtener version_id correctamente
             version_actual = doc_info.get('version_actual', 1)
             version_id = get_version_id(document_id, version_actual)
             
             if not version_id:
-                logger.error(f"No se encontró version_id para documento {document_id}, versión {version_actual}")
-                
-                log_document_processing_end(
-                    doc_registro_id,
-                    estado='error',
-                    mensaje_error=f"Version ID no encontrado para versión {version_actual}"
-                )
-                
-                # Generar UUID temporal para no fallar el proceso
+                logger.warning(f"⚠️ Version ID no encontrado, generando temporal")
                 version_id = generate_uuid()
-                logger.warning(f"Usando version_id temporal: {version_id}")
             
-            logger.info(f"Procesando documento {document_id}, versión {version_actual}, version_id: {version_id}")
+            logger.info(f"📄 Documento: {document_id}, Versión: {version_actual}, Version ID: {version_id}")
             
-            # Obtener resultados completos de Textract
+            # Obtener resultados de Textract
             textract_get_id = log_document_processing_start(
                 document_id,
-                'obtener_resultados_textract',
-                datos_entrada={"job_id": job_id, "job_type": job_type},
+                'obtener_resultados_textract_v2',
+                datos_entrada={"job_id": job_id},
                 analisis_id=doc_registro_id
             )
             
-            textract_results, processing_time = get_textract_results(job_id, job_type)
+            job_type = 'DOCUMENT_TEXT_DETECTION' if '_detection' in job_tag else 'DOCUMENT_ANALYSIS'
+            textract_results, get_time = get_textract_results_safe(job_id, job_type)
             
             if not textract_results:
-                logger.error(f"No se pudieron obtener resultados para el Job {job_id}")
-                
-                log_document_processing_end(
-                    textract_get_id,
-                    estado='error',
-                    mensaje_error=f"No se pudieron obtener resultados para Job {job_id}"
-                )
-                
-                update_document_processing_status(
-                    document_id, 
-                    'error',
-                    f"No se pudieron obtener resultados para el Job {job_id}"
-                )
-                
-                log_document_processing_end(
-                    doc_registro_id,
-                    estado='error',
-                    mensaje_error=f"Error obteniendo resultados de Textract"
-                )
-                
-                return {
-                    'statusCode': 500,
-                    'body': 'Error al obtener resultados de Textract'
-                }
+                raise ValueError(f"No se pudieron obtener resultados para JobId: {job_id}")
             
             log_document_processing_end(
                 textract_get_id,
                 estado='completado',
-                datos_procesados={"pages_count": len(textract_results)},
-                duracion_ms=int(processing_time * 1000)
+                datos_procesados={"pages_obtained": len(textract_results)},
+                duracion_ms=int(get_time * 1000)
             )
             
-            # Extraer TODOS los datos posibles en un único proceso
+            # Extracción completa de datos
             extraction_id = log_document_processing_start(
                 document_id,
-                'extraer_datos_completos',
+                'extraccion_completa_v2',
                 datos_entrada={"pages_count": len(textract_results)},
                 analisis_id=doc_registro_id
             )
             
-            logger.info(f"Extrayendo datos completos para documento {document_id}")
-            all_extracted_data = extract_complete_data_from_textract(textract_results)
+            logger.info(f"🔄 Iniciando extracción completa de datos...")
+            all_extracted_data = extract_complete_data_from_textract_fixed(textract_results)
+            
+            if not all_extracted_data['extraction_success']:
+                logger.warning(f"⚠️ Extracción parcialmente exitosa")
             
             log_document_processing_end(
                 extraction_id,
                 estado='completado',
                 datos_procesados={
+                    "extraction_success": all_extracted_data['extraction_success'],
                     "text_length": len(all_extracted_data.get('full_text', '')),
-                    "tables_count": len(all_extracted_data.get('tables', [])),
-                    "forms_count": len(all_extracted_data.get('forms', {}))
+                    "confidence": all_extracted_data.get('extraction_confidence', 0)
                 },
                 duracion_ms=int(all_extracted_data.get('processing_time', 0) * 1000)
             )
             
-            # Calcular confianza global
-            confidence = all_extracted_data['doc_type_info']['confidence']
-            doc_type_identified = all_extracted_data['doc_type_info']['document_type']
-            
-            # CORRECCIÓN 4: Obtener o crear analysis_id correctamente
-            analysis_lookup_id = log_document_processing_start(
-                document_id,
-                'obtener_analysis_id',
-                datos_entrada={"version_id": version_id},
-                analisis_id=doc_registro_id
-            )
-            
+            # Obtener o crear analysis_id
             analysis_id = get_analysis_id_for_document(document_id, version_id)
-            
             if not analysis_id:
-                # Si no existe, crear uno nuevo
                 analysis_id = generate_uuid()
-                logger.info(f"Creando nuevo analysis_id: {analysis_id} para versión {version_id}")
-                
-                # Crear registro de análisis básico
-                create_success = create_analysis_record_for_version(document_id, version_id, analysis_id)
-                if not create_success:
-                    logger.error(f"Error al crear registro de análisis para documento {document_id}")
-                
-                log_document_processing_end(
-                    analysis_lookup_id,
-                    estado='completado',
-                    datos_procesados={"analysis_id": analysis_id, "created_new": True}
-                )
-            else:
-                logger.info(f"Usando analysis_id existente: {analysis_id}")
-                
-                log_document_processing_end(
-                    analysis_lookup_id,
-                    estado='completado',
-                    datos_procesados={"analysis_id": analysis_id, "created_new": False}
-                )
+                create_analysis_record_for_version(document_id, version_id, analysis_id)
+                logger.info(f"➕ Nuevo analysis_id creado: {analysis_id}")
             
-            # Registrar datos extraídos en base de datos
+            # Actualizar base de datos
             db_update_id = log_document_processing_start(
                 document_id,
-                'actualizar_base_datos',
-                datos_entrada={"analysis_id": analysis_id, "confidence": confidence},
+                'actualizar_bd_v2',
+                datos_entrada={"analysis_id": analysis_id},
                 analisis_id=doc_registro_id
             )
             
             try:
-                # CORRECCIÓN 5: Actualizar el registro de análisis con parámetros correctos
+                # Actualizar análisis
+                confidence = all_extracted_data.get('extraction_confidence', 0.5)
+                doc_type = all_extracted_data.get('doc_type_info', {}).get('document_type', 'documento')
+                
                 update_success = update_analysis_record(
-                    analysis_id,  # ✅ CORRECTO: Usar analysis_id, no document_id
-                    all_extracted_data['full_text'],  # Texto completo extraído
-                    json.dumps(all_extracted_data['structured_data']),  # Entidades detectadas
-                    json.dumps({  # Metadatos de extracción
+                    analysis_id,
+                    all_extracted_data.get('full_text', ''),
+                    json.dumps(all_extracted_data.get('structured_data', {})),
+                    json.dumps({
                         'job_id': job_id,
-                        'job_type': job_type,
-                        'tables_count': len(all_extracted_data['tables']),
-                        'forms_count': len(all_extracted_data['forms']),
-                        'text_blocks_count': len(all_extracted_data['text_blocks']),
-                        'processing_time': all_extracted_data['processing_time'],
-                        'version_actual': version_actual,
-                        'version_id': version_id
+                        'extraction_metadata': all_extracted_data.get('metadata', {}),
+                        'query_answers': all_extracted_data.get('query_answers', {}),
+                        'extraction_confidence': confidence,
+                        'version_info': {'version_actual': version_actual, 'version_id': version_id}
                     }),
-                    'textract_completado',  # Estado de análisis
-                    f"textract-{job_type}",  # Versión del modelo
-                    int(processing_time * 1000),  # Tiempo de procesamiento en ms
-                    'textract_callback',  # Procesado por
-                    confidence < 0.85,  # Requiere verificación si confianza baja
-                    False,  # No verificado aún
-                    mensaje_error=None,
+                    'textract_completado_v2',
+                    f"textract-{job_type}",
+                    int(get_time * 1000),
+                    'textract_callback_v2',
+                    confidence < 0.85,
+                    False,
+                    mensaje_error=all_extracted_data.get('error_message'),
                     confianza_clasificacion=confidence,
-                    tipo_documento=doc_type_identified,
-                    id_version=version_id  # ✅ AGREGAR: Pasar version_id
+                    tipo_documento=doc_type,
+                    id_version=version_id
                 )
                 
                 if not update_success:
-                    raise Exception("No se pudo actualizar el registro de análisis")
+                    logger.warning("⚠️ Update analysis falló, pero continuando...")
                 
-                # 2. Actualizar documento con todos los datos extraídos
-                extraction_data = {
-                    'document_type': doc_type_identified,
+                # Actualizar documento
+                extraction_summary = {
+                    'document_type': doc_type,
                     'confidence': confidence,
-                    'text_sample': all_extracted_data['full_text'][:1000] if all_extracted_data['full_text'] else '',
-                    'tables': all_extracted_data['tables'],
-                    'forms': all_extracted_data['forms'],
-                    'structured_data': all_extracted_data['structured_data'],
-                    'specific_data': all_extracted_data['specific_data'],
-                    'version_info': {
-                        'version_actual': version_actual,
-                        'version_id': version_id,
-                        'processed_by': 'textract_callback'
-                    }
+                    'extraction_success': all_extracted_data['extraction_success'],
+                    'tables_count': len(all_extracted_data.get('tables', [])),
+                    'forms_count': len(all_extracted_data.get('forms', {})),
+                    'queries_count': len(all_extracted_data.get('query_answers', {})),
+                    'version_info': {'version_actual': version_actual, 'version_id': version_id}
                 }
                 
                 update_document_extraction_data(
                     document_id,
-                    extraction_data,
+                    extraction_summary,
                     confidence,
-                    False  # No validado aún
+                    False
                 )
                 
-                logger.info(f"Datos extraídos guardados correctamente para documento {document_id}, versión {version_actual}")
-                
-                # 3. Actualizar estado de procesamiento
+                # Actualizar estado
                 update_document_processing_status(
-                    document_id, 
-                    'textract_completado',
-                    f"Extracción completada con confianza {confidence:.2f} para versión {version_actual}",
-                    tipo_documento=doc_type_identified
+                    document_id,
+                    'textract_completado_v2',
+                    f"Extracción completada con confianza {confidence:.2f}",
+                    tipo_documento=doc_type
                 )
                 
                 log_document_processing_end(
                     db_update_id,
                     estado='completado',
-                    confianza=confidence,
-                    datos_procesados={
-                        "analysis_updated": True,
-                        "document_updated": True,
-                        "status_updated": True
-                    }
+                    datos_procesados={"analysis_updated": update_success, "document_updated": True}
                 )
                 
-                # 4. Determinar la cola SQS para el siguiente paso de procesamiento
-                queue_determination_id = log_document_processing_start(
-                    document_id,
-                    'determinar_cola_siguiente',
-                    datos_entrada={"doc_type": doc_type_identified},
-                    analisis_id=doc_registro_id
-                )
+                # Enviar a procesador específico
+                queue_url = determine_processor_queue(doc_type)
                 
-                queue_url = determine_processor_queue(doc_type_identified)
-                
-                log_document_processing_end(
-                    queue_determination_id,
-                    estado='completado',
-                    datos_procesados={"queue_url": queue_url}
-                )
-                
-                # 5. Crear mensaje para el procesador específico
-                # IMPORTANTE: Solo enviamos la referencia al documento, no los datos completos
-                # Los datos ya están en la base de datos con la versión correcta
                 message = {
                     'document_id': document_id,
-                    'document_type': doc_type_identified,
+                    'document_type': doc_type,
                     'confidence': confidence,
-                    'extraction_complete': True,  # Indicar que ya se ha completado la extracción
-                    'specific_data_available': bool(all_extracted_data['specific_data']),
+                    'extraction_complete': True,
                     'version_info': {
                         'version_actual': version_actual,
                         'version_id': version_id,
                         'analysis_id': analysis_id
+                    },
+                    'processing_metadata': {
+                        'job_id': job_id,
+                        'extraction_success': all_extracted_data['extraction_success']
                     }
                 }
-                
-                # 6. Enviar a cola SQS
-                sqs_send_id = log_document_processing_start(
-                    document_id,
-                    'enviar_cola_sqs',
-                    datos_entrada={"queue_url": queue_url, "message_size": len(json.dumps(message))},
-                    analisis_id=doc_registro_id
-                )
                 
                 sqs_client.send_message(
                     QueueUrl=queue_url,
                     MessageBody=json.dumps(message)
                 )
                 
-                log_document_processing_end(
-                    sqs_send_id,
-                    estado='completado',
-                    datos_procesados={"queue_url": queue_url}
-                )
-                
-                logger.info(f"Documento {document_id} (versión {version_actual}) enviado a procesador específico: {queue_url}")
+                logger.info(f"📤 Documento enviado a procesador: {queue_url}")
                 
                 log_document_processing_end(
                     doc_registro_id,
                     estado='completado',
-                    confianza=confidence,
                     datos_procesados={
-                        "document_type": doc_type_identified,
-                        "version_actual": version_actual,
-                        "analysis_id": analysis_id,
+                        "document_type": doc_type,
+                        "confidence": confidence,
                         "next_queue": queue_url
                     }
                 )
                 
             except Exception as db_error:
-                logger.error(f"Error al guardar datos extraídos: {str(db_error)}")
+                logger.error(f"❌ Error en actualización de BD: {str(db_error)}")
                 
                 log_document_processing_end(
                     db_update_id,
@@ -1485,37 +1196,42 @@ def lambda_handler(event, context):
                     mensaje_error=str(db_error)
                 )
                 
+                # Actualizar al menos el estado
                 update_document_processing_status(
-                    document_id, 
-                    'error',
-                    f"Error al guardar datos extraídos: {str(db_error)}"
+                    document_id,
+                    'error_actualizacion_bd',
+                    f"Error actualizando BD: {str(db_error)}"
                 )
                 
                 log_document_processing_end(
                     doc_registro_id,
                     estado='error',
-                    mensaje_error=f"Error en base de datos: {str(db_error)}"
+                    mensaje_error=f"Error BD: {str(db_error)}"
                 )
-                
-                return {
-                    'statusCode': 500,
-                    'body': json.dumps({
-                        'error': 'Error al procesar datos extraídos',
-                        'details': str(db_error)
-                    })
-                }
-                
-        else:
-            # Manejar estados de error de Textract
-            error_message = f"Error en el procesamiento Textract: {status}"
+        
+        elif status == 'FAILED':
+            error_message = f"Textract falló para JobId: {job_id}"
+            logger.error(f"❌ {error_message}")
             
-            update_document_processing_status(document_id, 'error', error_message)
-            logger.error(error_message)
+            update_document_processing_status(
+                document_id,
+                'textract_fallido',
+                error_message
+            )
             
             log_document_processing_end(
                 doc_registro_id,
                 estado='error',
                 mensaje_error=error_message
+            )
+        
+        else:
+            logger.warning(f"⚠️ Estado inesperado: {status}")
+            
+            log_document_processing_end(
+                doc_registro_id,
+                estado='advertencia',
+                mensaje_error=f"Estado inesperado: {status}"
             )
         
         # Finalizar procesamiento exitoso
@@ -1525,6 +1241,7 @@ def lambda_handler(event, context):
             datos_procesados={
                 "document_id": document_id,
                 "status": status,
+                "job_id": job_id,
                 "processed_successfully": status == 'SUCCEEDED'
             }
         )
@@ -1532,31 +1249,30 @@ def lambda_handler(event, context):
         return {
             'statusCode': 200,
             'body': json.dumps({
+                'message': 'Callback procesado exitosamente',
                 'document_id': document_id,
                 'status': status,
-                'version_info': {
-                    'version_actual': version_actual if status == 'SUCCEEDED' else None,
-                    'version_id': version_id if status == 'SUCCEEDED' else None
-                },
-                'message': 'Procesamiento de notificación de Textract completado'
+                'job_id': job_id,
+                'timestamp': datetime.now().isoformat()
             })
         }
         
     except Exception as e:
-        logger.error(f"Error procesando notificación de Textract: {str(e)}")
+        logger.error(f"❌ Error crítico en callback: {str(e)}")
+        import traceback
+        logger.error(f"📍 Stack trace: {traceback.format_exc()}")
         
-        # Intentar obtener document_id para actualizar estado
+        # Intentar actualizar estado del documento si es posible
         try:
-            document_id = get_document_id_from_job_tag(message_json.get('JobTag', ''))
-            update_document_processing_status(
-                document_id, 
-                'error', 
-                f"Error en callback de Textract: {str(e)}"
-            )
+            if 'document_id' in locals() and document_id:
+                update_document_processing_status(
+                    document_id,
+                    'error_callback',
+                    f"Error en callback: {str(e)}"
+                )
         except Exception:
             logger.error("No se pudo actualizar estado del documento")
         
-        # Finalizar procesamiento con error
         log_document_processing_end(
             callback_registro_id,
             estado='error',
@@ -1566,7 +1282,8 @@ def lambda_handler(event, context):
         return {
             'statusCode': 500,
             'body': json.dumps({
-                'error': str(e),
-                'message': 'Error procesando notificación de Textract'
+                'error': 'Error procesando callback de Textract',
+                'message': str(e),
+                'timestamp': datetime.now().isoformat()
             })
         }

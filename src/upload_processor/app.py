@@ -7,7 +7,9 @@ import uuid
 import time
 import sys
 from datetime import datetime
+import traceback
 from urllib.parse import unquote_plus
+from textract_queries import get_queries_for_document_type, get_loan_contract_queries, get_account_contract_queries, get_id_document_queries, get_generic_contract_queries
 
 # Configurar el logger
 logger = logging.getLogger()
@@ -46,11 +48,18 @@ try:
         link_document_to_client,get_document_by_id,execute_query,log_document_processing_start,
         log_document_processing_end,preserve_document_data_before_update,verify_document_version_integrity,
         get_document_version_history,restore_document_version,compare_document_versions,
-        get_latest_extraction_data
+        get_latest_extraction_data,insert_migrated_document_info,get_version_id,update_document_extraction_data
+    )
+    from common.pdf_utils import (
+        extract_text_with_pypdf2,
+        extract_structured_patterns_pypdf2,
+        extract_type_specific_data_pypdf2, 
+        calculate_pypdf2_confidence,
+        normalize_date_safe 
     )
     from common.s3_utils import get_file_metadata, copy_s3_object, delete_s3_object
     from common.validation import validate_document, determine_document_type, get_document_expiry_info
-    from common.pdf_utils import extract_text_with_pypdf2
+ 
     from document_validator import determine_document_type_from_metadata
     logger.info("Módulos importados correctamente")
 except ImportError as e:
@@ -131,35 +140,76 @@ def should_use_textract(metadata, doc_type_info, preliminary_classification):
     logger.info(f"Tipo de documento indeterminado, usando Textract por defecto")
     return True
 
+#funciones de pypdf2
+
 def process_with_pypdf2(document_id, bucket, key, document_type_info, metadata):
     """
-    Procesa un PDF con PyPDF2 en lugar de Textract para ahorrar costos
+    🔧 VERSIÓN CORREGIDA: Procesa un PDF con PyPDF2 manteniendo CONSISTENCIA con Textract
+    Realiza TODOS los guardados que hace el callback de Textract para evitar inconsistencias
     """
     pypdf_registro_id = log_document_processing_start(
         document_id, 
-        'proceso_pypdf2',
+        'proceso_pypdf2_completo',
         datos_entrada={"bucket": bucket, "key": key, "metadata": metadata}
     )
     
     try:
-        logger.info(f"Extrayendo texto con PyPDF2 para documento {document_id}")
+        logger.info(f"🔄 Extrayendo texto con PyPDF2 para documento {document_id} (versión completa)")
         
-        # Extraer texto con PyPDF2
-        extracted_text = extract_text_with_pypdf2(bucket, key)
-        
-        if not extracted_text or extracted_text.startswith("ERROR:"):
-            logger.error(f"Error al extraer texto con PyPDF2: {extracted_text}")
+        # 1. ✅ OBTENER INFORMACIÓN DEL DOCUMENTO Y VERSIÓN
+        doc_info = get_document_by_id(document_id)
+        if not doc_info:
+            logger.error(f"❌ Documento {document_id} no encontrado")
             log_document_processing_end(
                 pypdf_registro_id, 
                 estado='error',
-                mensaje_error=f"Error al extraer texto con PyPDF2: {extracted_text}"
+                mensaje_error=f"Documento {document_id} no encontrado"
             )
             return False
         
-        # Determinar el tipo de documento con el texto extraído
+        version_actual = doc_info.get('version_actual', 1)
+        version_id = get_version_id(document_id, version_actual)
+        
+        if not version_id:
+            logger.warning(f"⚠️ Version ID no encontrado, generando temporal")
+            version_id = generate_uuid()
+        
+        logger.info(f"📄 Procesando: {document_id}, Versión: {version_actual}, Version ID: {version_id}")
+        
+        # 2. ✅ EXTRACCIÓN DE TEXTO CON PyPDF2
+        extraction_registro_id = log_document_processing_start(
+            document_id, 
+            'extraccion_pypdf2',
+            datos_entrada={"bucket": bucket, "key": key},
+            analisis_id=pypdf_registro_id
+        )
+        
+        extracted_text = extract_text_with_pypdf2(bucket, key)
+        
+        if not extracted_text or extracted_text.startswith("ERROR:"):
+            logger.error(f"❌ Error al extraer texto con PyPDF2: {extracted_text}")
+            log_document_processing_end(
+                extraction_registro_id, 
+                estado='error',
+                mensaje_error=f"Error al extraer texto con PyPDF2: {extracted_text}"
+            )
+            log_document_processing_end(
+                pypdf_registro_id, 
+                estado='error',
+                mensaje_error=f"Error al extraer texto con PyPDF2"
+            )
+            return False
+        
+        log_document_processing_end(
+            extraction_registro_id, 
+            estado='completado',
+            datos_procesados={"text_length": len(extracted_text)}
+        )
+        
+        # 3. ✅ DETERMINAR TIPO DE DOCUMENTO (IGUAL QUE TEXTRACT)
         doc_type_registro_id = log_document_processing_start(
             document_id, 
-            'determinar_tipo_documento',
+            'determinar_tipo_documento_pypdf2',
             datos_entrada={"texto_longitud": len(extracted_text)},
             analisis_id=pypdf_registro_id
         )
@@ -173,78 +223,224 @@ def process_with_pypdf2(document_id, bucket, key, document_type_info, metadata):
             datos_procesados=doc_type_info
         )
         
-        logger.info(f"Documento clasificado como {doc_type_info['document_type']} con confianza {doc_type_info['confidence']}")
+        logger.info(f"📝 Documento clasificado como {doc_type_info['document_type']} con confianza {doc_type_info['confidence']}")
         
-        # Guardar texto extraído y resultados en base de datos
-        update_registro_id = log_document_processing_start(
+        # 4. ✅ EXTRAER DATOS ESTRUCTURADOS (SIMULANDO TEXTRACT)
+        structured_registro_id = log_document_processing_start(
             document_id, 
-            'actualizar_analisis',
-            datos_entrada={"tipo_documento": doc_type_info['document_type'], "confianza": doc_type_info['confidence']},
+            'extraer_datos_estructurados_pypdf2',
+            datos_entrada={"doc_type": doc_type_info['document_type']},
             analisis_id=pypdf_registro_id
         )
         
-        update_analysis_record(
-            document_id,
-            extracted_text,
-            None,  # entidades detectadas
-            json.dumps(metadata),  # metadatos extracción
-            'procesado_pypdf2',
-            'pypdf2-1.0',
-            0,  # tiempo procesamiento
-            'upload_processor',
-            doc_type_info['confidence'] < 0.85,  # requiere verificación
-            False,  # verificado
-            mensaje_error=None,
-            confianza_clasificacion=doc_type_info['confidence'],
-            tipo_documento=doc_type_info['document_type']
+        # Crear datos estructurados similares a Textract
+        structured_data = extract_structured_patterns_pypdf2(extracted_text)
+        specific_data = extract_type_specific_data_pypdf2(
+            extracted_text, 
+            doc_type_info['document_type']
+        )
+        
+        # Calcular confianza general
+        extraction_confidence = calculate_pypdf2_confidence(
+            extracted_text, 
+            doc_type_info, 
+            structured_data
         )
         
         log_document_processing_end(
-            update_registro_id, 
-            estado='completado'
+            structured_registro_id, 
+            estado='completado',
+            datos_procesados={
+                "structured_entities": len(structured_data),
+                "confidence": extraction_confidence
+            }
         )
         
-        # Enviar mensaje a cola de clasificación indicando que ya hay texto extraído
-        sqs_registro_id = log_document_processing_start(
+        # 5. ✅ OBTENER O CREAR ANALYSIS_ID (IGUAL QUE TEXTRACT)
+        analysis_id = get_analysis_id_for_document(document_id, version_id)
+        if not analysis_id:
+            analysis_id = generate_uuid()
+            create_analysis_record_for_version(document_id, version_id, analysis_id)
+            logger.info(f"➕ Nuevo analysis_id creado: {analysis_id}")
+        
+        # 6. ✅ ACTUALIZAR ANÁLISIS (COMPLETO COMO TEXTRACT)
+        update_analysis_registro_id = log_document_processing_start(
             document_id, 
-            'enviar_sqs',
-            datos_entrada={"skip_textract": True, "extraction_complete": True},
+            'actualizar_analisis_pypdf2',
+            datos_entrada={
+                "analysis_id": analysis_id,
+                "confidence": extraction_confidence
+            },
             analisis_id=pypdf_registro_id
         )
         
+        # Crear metadatos de extracción completos
+        extraction_metadata = {
+            'extraction_method': 'pypdf2',
+            'version_info': {
+                'version_actual': version_actual,
+                'version_id': version_id
+            },
+            'text_stats': {
+                'character_count': len(extracted_text),
+                'word_count': len(extracted_text.split()),
+                'line_count': extracted_text.count('\n') + 1
+            },
+            'structured_data': structured_data,
+            'specific_data': specific_data,
+            'doc_type_info': doc_type_info,
+            'processing_timestamp': datetime.now().isoformat()
+        }
+        
+        # ✅ ACTUALIZAR ANÁLISIS COMPLETO
+        update_success = update_analysis_record(
+            analysis_id,  # ✅ Usar analysis_id correcto
+            extracted_text,
+            json.dumps(structured_data),  # entidades detectadas
+            json.dumps(extraction_metadata),  # metadatos extracción
+            'procesado_pypdf2_completo',  # estado
+            'pypdf2-2.0',  # version modelo
+            0,  # tiempo procesamiento
+            'upload_processor_pypdf2',  # procesado por
+            extraction_confidence < 0.85,  # requiere verificación
+            False,  # verificado
+            mensaje_error=None,
+            confianza_clasificacion=extraction_confidence,
+            tipo_documento=doc_type_info['document_type'],
+            id_version=version_id  # ✅ CRÍTICO: incluir version_id
+        )
+        
+        if not update_success:
+            logger.warning("⚠️ Update analysis falló, pero continuando...")
+        
+        log_document_processing_end(
+            update_analysis_registro_id, 
+            estado='completado' if update_success else 'advertencia',
+            datos_procesados={"analysis_updated": update_success}
+        )
+        
+        # 7. ✅ ACTUALIZAR TABLA DOCUMENTOS (IGUAL QUE TEXTRACT)
+        doc_update_registro_id = log_document_processing_start(
+            document_id, 
+            'actualizar_documento_pypdf2',
+            datos_entrada={"extraction_confidence": extraction_confidence},
+            analisis_id=pypdf_registro_id
+        )
+        
+        # Crear resumen de extracción igual que Textract
+        extraction_summary = {
+            'document_type': doc_type_info['document_type'],
+            'confidence': extraction_confidence,
+            'extraction_success': True,
+            'extraction_method': 'pypdf2',
+            'structured_entities': len(structured_data),
+            'text_length': len(extracted_text),
+            'version_info': {
+                'version_actual': version_actual,
+                'version_id': version_id,
+                'analysis_id': analysis_id
+            },
+            'processing_metadata': {
+                'processed_at': datetime.now().isoformat(),
+                'processor': 'upload_processor_pypdf2'
+            }
+        }
+        
+        # ✅ ACTUALIZAR DOCUMENTO CON DATOS EXTRAÍDOS
+        doc_update_success = update_document_extraction_data(
+            document_id,
+            extraction_summary,  # datos_extraidos_ia
+            extraction_confidence,  # confianza
+            False  # validado (aún no)
+        )
+        
+        log_document_processing_end(
+            doc_update_registro_id, 
+            estado='completado' if doc_update_success else 'advertencia',
+            datos_procesados={"document_updated": doc_update_success}
+        )
+        
+        # 8. ✅ ACTUALIZAR ESTADO DE PROCESAMIENTO
+        update_document_processing_status(
+            document_id, 
+            'pypdf2_completado',
+            f"Extracción completada con PyPDF2, confianza: {extraction_confidence:.2f}",
+            tipo_documento=doc_type_info['document_type']
+        )
+        
+        # 9. ✅ ENVIAR A COLA SQS CON DATOS COMPLETOS (IGUAL QUE TEXTRACT)
+        sqs_registro_id = log_document_processing_start(
+            document_id, 
+            'enviar_sqs_pypdf2',
+            datos_entrada={
+                "doc_type": doc_type_info['document_type'],
+                "extraction_complete": True
+            },
+            analisis_id=pypdf_registro_id
+        )
+        
+        # Determinar cola apropiada según tipo de documento
+        queue_url = determine_processor_queue(doc_type_info['document_type'])
+        
+        # ✅ MENSAJE COMPLETO IGUAL QUE TEXTRACT
         message = {
             'document_id': document_id,
-            'bucket': bucket,
-            'key': key,
-            'skip_textract': True,
+            'document_type': doc_type_info['document_type'],
+            'confidence': extraction_confidence,
             'extraction_complete': True,
-            'doc_type_info': doc_type_info,
-            'content_type': metadata['content_type']
+            'extraction_method': 'pypdf2',
+            'version_info': {
+                'version_actual': version_actual,
+                'version_id': version_id,
+                'analysis_id': analysis_id
+            },
+            'processing_metadata': {
+                'processor': 'upload_processor_pypdf2',
+                'extraction_success': True,
+                'text_length': len(extracted_text)
+            },
+            'skip_textract': True  # Indicar que ya se procesó
         }
         
         sqs_client.send_message(
-            QueueUrl=CLASSIFICATION_QUEUE_URL,
+            QueueUrl=queue_url,
             MessageBody=json.dumps(message)
         )
         
         log_document_processing_end(
             sqs_registro_id, 
             estado='completado',
-            datos_procesados={"queue_url": CLASSIFICATION_QUEUE_URL}
+            datos_procesados={
+                "queue_url": queue_url,
+                "message_sent": True
+            }
         )
         
-        logger.info(f"Documento {document_id} procesado con PyPDF2 y enviado a clasificación")
+        logger.info(f"📤 Documento {document_id} procesado con PyPDF2 y enviado a {queue_url}")
         
+        # 10. ✅ FINALIZAR PROCESAMIENTO
         log_document_processing_end(
             pypdf_registro_id, 
             estado='completado',
-            confianza=doc_type_info['confidence']
+            datos_procesados={
+                'document_type': doc_type_info['document_type'],
+                'confidence': extraction_confidence,
+                'analysis_id': analysis_id,
+                'version_id': version_id,
+                'extraction_method': 'pypdf2',
+                'processing_complete': True
+            },
+            confianza=extraction_confidence
         )
         
+        logger.info(f"✅ Documento {document_id} procesado completamente con PyPDF2")
         return True
         
     except Exception as e:
-        logger.error(f"Error en procesamiento PyPDF2: {str(e)}")
+        logger.error(f"❌ Error en procesamiento PyPDF2 completo: {str(e)}")
+        import traceback
+        logger.error(f"📍 Stack trace: {traceback.format_exc()}")
+        
         log_document_processing_end(
             pypdf_registro_id, 
             estado='error',
@@ -252,14 +448,114 @@ def process_with_pypdf2(document_id, bucket, key, document_type_info, metadata):
         )
         return False
 
+def get_analysis_id_for_document(document_id, version_id=None):
+    """
+    Obtiene el analysis_id existente para un documento/versión
+    """
+    try:
+        if version_id:
+            query = """
+            SELECT id_analisis FROM analisis_documento_ia 
+            WHERE id_documento = %s AND id_version = %s
+            ORDER BY fecha_analisis DESC 
+            LIMIT 1
+            """
+            result = execute_query(query, (document_id, version_id))
+        else:
+            query = """
+            SELECT id_analisis FROM analisis_documento_ia 
+            WHERE id_documento = %s
+            ORDER BY fecha_analisis DESC 
+            LIMIT 1
+            """
+            result = execute_query(query, (document_id,))
+        
+        if result:
+            return result[0]['id_analisis']
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error obteniendo analysis_id: {str(e)}")
+        return None
+
+def create_analysis_record_for_version(document_id, version_id, analysis_id):
+    """
+    Crea un registro de análisis básico para una versión
+    """
+    try:
+        analysis_data = {
+            'id_analisis': analysis_id,
+            'id_documento': document_id,
+            'id_version': version_id,
+            'tipo_documento': 'documento',
+            'confianza_clasificacion': 0.5,
+            'texto_extraido': None,
+            'entidades_detectadas': None,
+            'metadatos_extraccion': json.dumps({'created_for': 'pypdf2_processing'}),
+            'fecha_analisis': datetime.now().isoformat(),
+            'estado_analisis': 'iniciado',
+            'mensaje_error': None,
+            'version_modelo': 'pypdf2-basic',
+            'tiempo_procesamiento': 0,
+            'procesado_por': 'upload_processor',
+            'requiere_verificacion': True,
+            'verificado': False,
+            'verificado_por': None,
+            'fecha_verificacion': None
+        }
+        
+        insert_analysis_record(analysis_data)
+        logger.info(f"Registro de análisis creado: {analysis_id}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error creando registro de análisis: {str(e)}")
+        return False
+
+def validate_document_version_consistency(document_id):
+    """
+    Valida la consistencia entre documento y versiones
+    """
+    try:
+        # Obtener información del documento
+        doc_query = """
+        SELECT id_documento, version_actual 
+        FROM documentos 
+        WHERE id_documento = %s
+        """
+        doc_result = execute_query(doc_query, (document_id,))
+        
+        if not doc_result:
+            return False, "Documento no encontrado"
+        
+        version_actual = doc_result[0]['version_actual']
+        
+        # Verificar que la versión actual existe
+        version_query = """
+        SELECT id_version 
+        FROM versiones_documento 
+        WHERE id_documento = %s AND numero_version = %s
+        """
+        version_result = execute_query(version_query, (document_id, version_actual))
+        
+        if not version_result:
+            return False, f"Versión actual {version_actual} no encontrada"
+        
+        return True, f"Consistencia validada para documento {document_id}, versión {version_actual}"
+        
+    except Exception as e:
+        logger.error(f"Error validando consistencia: {str(e)}")
+        return False, str(e)
+
+#fin de funciones de pypdf2
+
 def start_textract_processing(document_id, bucket, key, document_type_info=None, preliminary_classification=None):
     """
-    Inicia el procesamiento asíncrono con Textract.
-    VERSIÓN MEJORADA con mejor manejo de metadatos del job.
+    FIXED VERSION: Proper Textract parameter configuration
     """
     textract_registro_id = log_document_processing_start(
         document_id, 
-        'iniciar_textract_mejorado',
+        'iniciar_textract_corregido',
         datos_entrada={
             "bucket": bucket, 
             "key": key, 
@@ -268,82 +564,66 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
     )
     
     try:
-        # Verificar que tengamos las variables de entorno necesarias
+        # Verificar configuración requerida
         if not TEXTRACT_SNS_TOPIC or not TEXTRACT_ROLE_ARN:
             logger.warning("Variables de entorno para Textract asíncrono no configuradas")
-            
-            # Enviar directamente a clasificación sin procesamiento Textract
-            fallback_message = {
-                'document_id': document_id,
-                'bucket': bucket,
-                'key': key,
-                'skip_textract': True,
-                'document_type_info': document_type_info,
-                'preliminary_classification': preliminary_classification,
-                'reason': 'sns_not_configured'
-            }
-            
-            sqs_registro_id = log_document_processing_start(
-                document_id, 
-                'enviar_sqs_sin_textract',
-                datos_entrada={"skip_textract": True, "reason": "sns_not_configured"},
-                analisis_id=textract_registro_id
-            )
-            
-            sqs_client.send_message(
-                QueueUrl=CLASSIFICATION_QUEUE_URL,
-                MessageBody=json.dumps(fallback_message)
-            )
-            
-            log_document_processing_end(
-                sqs_registro_id, 
-                estado='completado',
-                datos_procesados={"queue_url": CLASSIFICATION_QUEUE_URL}
-            )
-            
-            logger.info(f"Documento {document_id} enviado a clasificación sin Textract (SNS no configurado)")
-            
-            log_document_processing_end(
-                textract_registro_id, 
-                estado='completado',
-                mensaje_error="SNS no configurado, proceso saltado"
-            )
-            
-            return True  # Consideramos exitoso aunque no use Textract
-            
-        # Obtener información de versión actual para incluir en job tag
+            return send_to_classification_fallback(document_id, bucket, key, preliminary_classification)
+        
+        # Obtener información de versión
         doc_info = get_document_by_id(document_id)
         version_actual = doc_info.get('version_actual', 1) if doc_info else 1
         
-        # Optimización: Determinar el tipo de análisis según el tipo de documento
-        feature_types = ['TABLES', 'FORMS']
+        # Determinar tipo de documento para configuración
+        doc_type = preliminary_classification.get('doc_type', 'documento') if preliminary_classification else 'documento'
         
-        # Crear job_tag más informativo que incluya versión
+        # ✅ CONFIGURACIÓN BASE SIEMPRE VÁLIDA
+        feature_types = ['TABLES', 'FORMS']
         job_tag = f"{document_id}_v{version_actual}_textract"
         
-        # Personalizar análisis según el tipo de documento preliminar
-        if preliminary_classification and preliminary_classification.get('doc_type'):
-            doc_type = preliminary_classification.get('doc_type').lower()
+        # ✅ CONFIGURACIÓN DE QUERIES MEJORADA
+        queries_config = None
+        
+        # Solo agregar QUERIES si tenemos configuración válida
+        try:
+            queries = None
             
-            # Para contratos usamos análisis más completo
-            if doc_type == 'contrato':
-                feature_types = ['TABLES', 'FORMS', 'QUERIES']
-                job_tag = f"{document_id}_v{version_actual}_contract_analysis"
-            
-            # Para documentos de identidad priorizamos el texto
-            elif doc_type in ['dni', 'pasaporte']:
-                feature_types = ['FORMS']
+            if doc_type in ['contrato', 'contrato_prestamo', 'prestamo_personal']:
+                queries = get_loan_contract_queries()
+                job_tag = f"{document_id}_v{version_actual}_loan_analysis"
+            elif doc_type in ['contrato_cuenta', 'apertura_cuenta']:
+                queries = get_account_contract_queries()
+                job_tag = f"{document_id}_v{version_actual}_account_analysis"
+            elif doc_type in ['dni', 'pasaporte', 'cedula']:
+                queries = get_id_document_queries()
                 job_tag = f"{document_id}_v{version_actual}_id_analysis"
+            else:
+                queries = get_generic_contract_queries()
+                job_tag = f"{document_id}_v{version_actual}_generic_analysis"
+            
+            # ✅ VALIDACIÓN CRÍTICA: Solo usar queries si están disponibles y son válidas
+            if queries and isinstance(queries, list) and len(queries) > 0:
+                # Validar que cada query tenga la estructura correcta
+                valid_queries = []
+                for query in queries:
+                    if isinstance(query, dict) and 'Text' in query and 'Alias' in query:
+                        # Validar que Text y Alias no estén vacíos
+                        if query['Text'].strip() and query['Alias'].strip():
+                            valid_queries.append(query)
                 
-            # Para documentos financieros priorizamos tablas
-            elif doc_type in ['extracto', 'nomina', 'impuesto']:
-                feature_types = ['TABLES', 'FORMS']
-                job_tag = f"{document_id}_v{version_actual}_financial_analysis"
+                if valid_queries:
+                    feature_types.append('QUERIES')
+                    queries_config = {'Queries': valid_queries}
+                    logger.info(f"✅ QueriesConfig configurado: {len(valid_queries)} queries válidas")
+                else:
+                    logger.warning(f"⚠️ Queries disponibles pero ninguna válida para tipo: {doc_type}")
+            else:
+                logger.info(f"ℹ️ Sin queries configuradas para tipo: {doc_type}")
+                
+        except Exception as query_error:
+            logger.error(f"❌ Error configurando queries: {str(query_error)}")
+            # Continuar sin queries en caso de error
         
-        # Configurar notificación SNS para cuando termine el proceso
-        logger.info(f"Iniciando procesamiento asíncrono con Textract para {document_id} v{version_actual}")
-        
-        # Preparamos parámetros de Textract optimizados
+        # ✅ PREPARAR PARÁMETROS DE TEXTRACT
         textract_params = {
             'DocumentLocation': {
                 'S3Object': {
@@ -352,169 +632,132 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
                 }
             },
             'FeatureTypes': feature_types,
-            'JobTag': job_tag,  # ✅ Job tag mejorado con versión
+            'JobTag': job_tag,
             'NotificationChannel': {
                 'SNSTopicArn': TEXTRACT_SNS_TOPIC,
                 'RoleArn': TEXTRACT_ROLE_ARN
             }
         }
         
-        # Añadir QueriesConfig si es un contrato u otro documento complejo
-        if 'QUERIES' in feature_types:
-            textract_params['QueriesConfig'] = {
-                'Queries': [
-                    {'Text': '¿Cuál es el nombre completo del titular?'},
-                    {'Text': '¿Cuál es el número de pasaporte?'},
-                    {'Text': '¿Cuál es la nacionalidad?'},
-                    {'Text': '¿Cuál es la fecha de nacimiento?'},
-                    {'Text': '¿Cuál es el sexo?'},
-                    {'Text': '¿Cuál es la autoridad emisora del pasaporte?'},
-                    {'Text': '¿Cuál es la fecha de expedición del pasaporte?'},
-                    {'Text': '¿Cuál es la fecha de expiración del pasaporte?'},
-                    {'Text': '¿Cuál es el país de emisión del pasaporte?'},
-                    {'Text': '¿Qué tipo de pasaporte es (ordinario, diplomático)?'},
-                    {'Text': '¿Cuál es el nombre completo?'},
-                    {'Text': '¿Cuál es la cédula o número de identificación?'},
-                    {'Text': '¿Cuál es la fecha de nacimiento?'},
-                    {'Text': '¿Cuál es el lugar de nacimiento?'},
-                    {'Text': '¿Cuál es el sexo?'},
-                    {'Text': '¿Cuál es el tipo de sangre?'},
-                    {'Text': '¿Cuál es la fecha de expedición?'},
-                    {'Text': '¿Cuál es la fecha de expiración?'},
-                    {'Text': '¿Qué entidad emitió este documento?'},
-                    {'Text': '¿Cuál es el propósito del documento?'}
-                ]
-            }
+        # ✅ AGREGAR QUERIES SOLO SI ESTÁN CONFIGURADAS
+        if queries_config:
+            textract_params['QueriesConfig'] = queries_config
+            logger.info(f"✅ QueriesConfig añadido con {len(queries_config['Queries'])} queries")
         
-        # Iniciar análisis de documento (proceso asíncrono)
-        start_job_registro_id = log_document_processing_start(
-            document_id, 
-            'textract_start_job',
-            datos_entrada={
-                "feature_types": feature_types, 
-                "job_tag": job_tag,
-                "version": version_actual
-            },
-            analisis_id=textract_registro_id
-        )
+        # ✅ VALIDACIÓN FINAL DE PARÁMETROS
+        logger.info(f"🔍 Parámetros de Textract:")
+        logger.info(f"   - Bucket: {bucket}")
+        logger.info(f"   - Key: {key}")
+        logger.info(f"   - FeatureTypes: {feature_types}")
+        logger.info(f"   - JobTag: {job_tag}")
+        logger.info(f"   - Queries: {'Sí' if queries_config else 'No'}")
         
-        textract_response = textract_client.start_document_analysis(**textract_params)
-        
-        job_id = textract_response['JobId']
-        logger.info(f"Iniciado procesamiento asíncrono de Textract: JobId={job_id} para documento {document_id} v{version_actual}")
-        
-        log_document_processing_end(
-            start_job_registro_id, 
-            estado='completado',
-            datos_procesados={
-                "job_id": job_id,
-                "job_tag": job_tag,
-                "version": version_actual
-            }
-        )
-        
-        # Actualizar en la base de datos con todos los detalles incluyendo versión
-        update_status_registro_id = log_document_processing_start(
-            document_id, 
-            'actualizar_estado_textract',
-            datos_entrada={
-                "job_id": job_id, 
-                "version": version_actual,
-                "feature_types": feature_types
-            },
-            analisis_id=textract_registro_id
-        )
-        
+        # ✅ INICIAR TEXTRACT CON MANEJO DE ERRORES MEJORADO
         try:
+            logger.info(f"🚀 Iniciando Textract con configuración validada")
+            textract_response = textract_client.start_document_analysis(**textract_params)
+            
+            job_id = textract_response['JobId']
+            logger.info(f"✅ Textract iniciado exitosamente: JobId={job_id}")
+            
+            # Actualizar estado en BD
+            metadata = {
+                'textract_job_id': job_id,
+                'textract_job_tag': job_tag,
+                'feature_types': feature_types,
+                'queries_count': len(queries_config['Queries']) if queries_config else 0,
+                'doc_type': doc_type,
+                'version_info': {
+                    'version_actual': version_actual,
+                    'processed_at': datetime.now().isoformat()
+                },
+                'bucket': bucket,
+                'key': key
+            }
+            
             update_document_processing_status(
                 document_id, 
                 'textract_iniciado',
-                json.dumps({
-                    'textract_job_id': job_id,
-                    'textract_job_type': 'ANALYSIS',
-                    'textract_job_tag': job_tag,
-                    'feature_types': feature_types,
-                    'preliminary_classification': preliminary_classification,
-                    'version_info': {
-                        'version_actual': version_actual,
-                        'processed_at': datetime.now().isoformat()
-                    }
-                }),
-                tipo_documento=preliminary_classification.get('doc_type') if preliminary_classification else None
+                json.dumps(metadata),
+                tipo_documento=doc_type
             )
             
             log_document_processing_end(
-                update_status_registro_id, 
-                estado='completado'
+                textract_registro_id, 
+                estado='completado',
+                datos_procesados={
+                    "job_id": job_id, 
+                    "job_tag": job_tag,
+                    "feature_types": feature_types,
+                    "queries_count": len(queries_config['Queries']) if queries_config else 0
+                }
             )
             
-        except Exception as db_error:
-            logger.error(f"Error al actualizar estado en BD: {str(db_error)}, pero continuando procesamiento")
+            return True
             
-            log_document_processing_end(
-                update_status_registro_id, 
-                estado='error',
-                mensaje_error=str(db_error)
-            )
-        
-        log_document_processing_end(
-            textract_registro_id, 
-            estado='completado',
-            datos_procesados={
-                "job_id": job_id, 
-                "job_tag": job_tag,
-                "feature_types": feature_types,
-                "version": version_actual
-            }
-        )
-        
-        return True
+        except Exception as textract_error:
+            error_message = str(textract_error)
+            logger.error(f"❌ Error específico de Textract: {error_message}")
+            
+            # Diagnóstico específico del error
+            if "InvalidParameterException" in error_message:
+                logger.error("🔧 Error de parámetros inválidos - Verificando configuración:")
+                logger.error(f"   - SNS Topic: {TEXTRACT_SNS_TOPIC}")
+                logger.error(f"   - Role ARN: {TEXTRACT_ROLE_ARN}")
+                logger.error(f"   - Bucket existe: {bucket}")
+                logger.error(f"   - Key válida: {key}")
+                
+                # Intentar sin queries como fallback
+                if queries_config:
+                    logger.info("🔧 Reintentando sin queries...")
+                    fallback_params = textract_params.copy()
+                    del fallback_params['QueriesConfig']
+                    fallback_params['FeatureTypes'] = ['TABLES', 'FORMS']
+                    fallback_params['JobTag'] = f"{document_id}_v{version_actual}_fallback"
+                    
+                    try:
+                        textract_response = textract_client.start_document_analysis(**fallback_params)
+                        job_id = textract_response['JobId']
+                        logger.info(f"✅ Textract fallback exitoso: JobId={job_id}")
+                        
+                        # Actualizar con configuración fallback
+                        fallback_metadata = {
+                            'textract_job_id': job_id,
+                            'textract_job_tag': fallback_params['JobTag'],
+                            'feature_types': ['TABLES', 'FORMS'],
+                            'queries_count': 0,
+                            'doc_type': doc_type,
+                            'fallback_used': True,
+                            'original_error': error_message
+                        }
+                        
+                        update_document_processing_status(
+                            document_id, 
+                            'textract_iniciado_fallback',
+                            json.dumps(fallback_metadata),
+                            tipo_documento=doc_type
+                        )
+                        
+                        log_document_processing_end(
+                            textract_registro_id, 
+                            estado='completado',
+                            datos_procesados={
+                                "job_id": job_id, 
+                                "fallback_used": True,
+                                "original_error": error_message
+                            }
+                        )
+                        
+                        return True
+                        
+                    except Exception as fallback_error:
+                        logger.error(f"❌ Fallback también falló: {str(fallback_error)}")
+            
+            # Si todo falla, usar fallback SQS
+            raise textract_error
         
     except Exception as e:
-        logger.error(f"Error al iniciar procesamiento Textract: {str(e)}")
-        
-        # En caso de error, enviar directamente a la cola de clasificación
-        try:
-            error_sqs_registro_id = log_document_processing_start(
-                document_id, 
-                'enviar_sqs_error_textract',
-                datos_entrada={"error": True, "error_message": str(e)},
-                analisis_id=textract_registro_id
-            )
-            
-            error_message = {
-                'document_id': document_id,
-                'bucket': bucket,
-                'key': key,
-                'error': True,
-                'error_message': str(e),
-                'skip_textract': True,
-                'document_type_info': document_type_info,
-                'preliminary_classification': preliminary_classification
-            }
-            
-            sqs_client.send_message(
-                QueueUrl=CLASSIFICATION_QUEUE_URL,
-                MessageBody=json.dumps(error_message)
-            )
-            
-            log_document_processing_end(
-                error_sqs_registro_id, 
-                estado='completado',
-                datos_procesados={"queue_url": CLASSIFICATION_QUEUE_URL}
-            )
-            
-            logger.info(f"Documento {document_id} enviado a clasificación tras error en Textract")
-            
-        except Exception as sqs_error:
-            logger.error(f"Error al enviar mensaje a SQS: {str(sqs_error)}")
-            
-            if 'error_sqs_registro_id' in locals():
-                log_document_processing_end(
-                    error_sqs_registro_id, 
-                    estado='error',
-                    mensaje_error=str(sqs_error)
-                )
+        logger.error(f"❌ Error general al iniciar Textract: {str(e)}")
         
         log_document_processing_end(
             textract_registro_id, 
@@ -522,8 +765,82 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
             mensaje_error=str(e)
         )
         
+        # Fallback: enviar sin Textract
+        return send_to_classification_fallback(document_id, bucket, key, preliminary_classification)
+
+def send_to_classification_without_textract(document_id, bucket, key, preliminary_classification):
+    """
+    🎯 VA EN UPLOAD_PROCESSOR
+    Fallback cuando Textract no funciona
+    """
+    try:
+        message = {
+            'document_id': document_id,
+            'bucket': bucket,
+            'key': key,
+            'skip_textract': True,
+            'preliminary_classification': preliminary_classification
+        }
+        
+        sqs_client.send_message(
+            QueueUrl=CLASSIFICATION_QUEUE_URL,
+            MessageBody=json.dumps(message)
+        )
+        
+        logger.info(f"📤 Documento enviado a clasificación (sin Textract)")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Error en fallback: {str(e)}")
         return False
 
+def send_to_classification_fallback(document_id, bucket, key, preliminary_classification):
+    """
+    Función de fallback cuando Textract falla - envía a clasificación sin procesamiento OCR
+    """
+    try:
+        message = {
+            'document_id': document_id,
+            'bucket': bucket,
+            'key': key,
+            'skip_textract': True,
+            'preliminary_classification': preliminary_classification,
+            'reason': 'textract_failed',
+            'fallback_processing': True
+        }
+        
+        sqs_client.send_message(
+            QueueUrl=CLASSIFICATION_QUEUE_URL,
+            MessageBody=json.dumps(message)
+        )
+        
+        # Actualizar estado en BD
+        update_document_processing_status(
+            document_id, 
+            'enviado_clasificacion_fallback',
+            json.dumps({
+                'reason': 'textract_failed',
+                'classification_queue': CLASSIFICATION_QUEUE_URL,
+                'preliminary_classification': preliminary_classification
+            })
+        )
+        
+        logger.info(f"📤 Documento {document_id} enviado a clasificación (fallback por error Textract)")
+        return True
+        
+    except Exception as sqs_error:
+        logger.error(f"❌ Error en fallback SQS: {str(sqs_error)}")
+        
+        # Último recurso: actualizar estado como error
+        update_document_processing_status(
+            document_id, 
+            'error',
+            f"Error en Textract y fallback SQS: {str(sqs_error)}"
+        )
+        
+        return False
+# PASO 2: Procesar los resultados de queries en el callback
+ 
 def process_document_metadata(document_id, metadata, bucket, key):
     """Procesa los metadatos del documento y actualiza la base de datos"""
     metadata_registro_id = log_document_processing_start(
@@ -536,7 +853,8 @@ def process_document_metadata(document_id, metadata, bucket, key):
         # Generar IDs únicos para versión y análisis
         version_id = generate_uuid()
         analysis_id = generate_uuid()
-        
+        # NUEVA VALIDACIÓN: Obtener metadatos adicionales de S3
+ 
         # Clasificación preliminar basada en metadatos y nombre
         preliminary_classification = determine_document_type_from_metadata(metadata, metadata['filename'])
         
@@ -562,10 +880,11 @@ def process_document_metadata(document_id, metadata, bucket, key):
         
         # Obtener ID del cliente desde metadatos de S3 si existe
         client_id = None
+        external_file_id = None
         try:
             s3_response = s3_client.head_object(Bucket=bucket, Key=key)
             client_id = s3_response.get('Metadata', {}).get('client-id')
-             
+            external_file_id = s3_response.get('Metadata', {}).get('external-file-id') 
         except Exception as e:
             logger.warning(f"No se pudieron obtener metadatos adicionales: {str(e)}")
         
@@ -597,7 +916,6 @@ def process_document_metadata(document_id, metadata, bucket, key):
                     estado='error',
                     mensaje_error=str(link_error)
                 )
-    
  
         # Preparar datos para inserción en base de datos
         document_data = {
@@ -705,6 +1023,48 @@ def process_document_metadata(document_id, metadata, bucket, key):
                 datos_procesados=result
             )
             
+                    # NUEVA FUNCIONALIDAD: Registrar documento migrado si aplica
+            if external_file_id and client_id:
+                try:
+                    migration_registro_id = log_document_processing_start(
+                        document_id, 
+                        'registrar_migracion',
+                        datos_entrada={
+                            "external_file_id": external_file_id,
+                            "client_id": client_id
+                        },
+                        analisis_id=metadata_registro_id
+                    )
+                    
+                    # Registrar en tabla de documentos migrados
+                    insert_migrated_document_info(
+                        creatio_file_id=external_file_id,
+                        id_documento=document_id,
+                        id_cliente=client_id,
+                        nombre_archivo=metadata['filename']
+                    )
+                    
+                    log_document_processing_end(
+                        migration_registro_id, 
+                        estado='completado',
+                        datos_procesados={"migrated_document_registered": True}
+                    )
+                    
+                    logger.info(f"Documento migrado registrado: {external_file_id} -> {document_id}")
+                    
+                except Exception as migration_error:
+                    logger.error(f"Error al registrar documento migrado: {str(migration_error)}")
+                    
+                    if 'migration_registro_id' in locals():
+                        log_document_processing_end(
+                            migration_registro_id, 
+                            estado='error',
+                            mensaje_error=str(migration_error)
+                        )
+            
+            logger.info(f"Documento {document_id} registrado en base de datos correctamente")
+            
+
             return result
             
         except Exception as db_error:
@@ -1144,7 +1504,8 @@ def process_new_document_version(document_id, file_metadata, dest_bucket, dest_k
         SET version_actual = %s,
             fecha_modificacion = %s,
             modificado_por = %s,
-            estado = 'PENDIENTE_PROCESAMIENTO'
+            titulo = %s,
+            estado = 'Pendiente_procesamiento'
         WHERE id_documento = %s
         """
         
@@ -1155,6 +1516,7 @@ def process_new_document_version(document_id, file_metadata, dest_bucket, dest_k
                     new_version_number, 
                     datetime.now().isoformat(), 
                     existing_document.get('modificado_por', '691d8c44-f524-48fd-b292-be9e31977711'), 
+                    file_metadata['filename'],
                     document_id
                 ), 
                 fetch=False
@@ -1467,6 +1829,7 @@ def lambda_handler(event, context):
                     document_id = metadata.get('document-id')
                     client_id = metadata.get('client-id')
                     is_new_version = metadata.get('is-new-version') == 'true'
+
                     
                     logger.info(f"Metadatos: document_id={document_id}, client_id={client_id}, is_new_version={is_new_version}")
                     
