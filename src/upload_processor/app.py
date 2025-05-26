@@ -551,11 +551,11 @@ def validate_document_version_consistency(document_id):
 
 def start_textract_processing(document_id, bucket, key, document_type_info=None, preliminary_classification=None):
     """
-    FIXED VERSION: Proper Textract parameter configuration
+    VERSIÓN CORREGIDA: Configuración robusta de Textract con validación de queries
     """
     textract_registro_id = log_document_processing_start(
         document_id, 
-        'iniciar_textract_corregido',
+        'iniciar_textract_v3',
         datos_entrada={
             "bucket": bucket, 
             "key": key, 
@@ -580,13 +580,13 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
         feature_types = ['TABLES', 'FORMS']
         job_tag = f"{document_id}_v{version_actual}_textract"
         
-        # ✅ CONFIGURACIÓN DE QUERIES MEJORADA
+        # ✅ CONFIGURACIÓN DE QUERIES MEJORADA CON VALIDACIÓN EXHAUSTIVA
         queries_config = None
         
-        # Solo agregar QUERIES si tenemos configuración válida
         try:
             queries = None
             
+            # Obtener queries según tipo de documento
             if doc_type in ['contrato', 'contrato_prestamo', 'prestamo_personal']:
                 queries = get_loan_contract_queries()
                 job_tag = f"{document_id}_v{version_actual}_loan_analysis"
@@ -600,20 +600,60 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
                 queries = get_generic_contract_queries()
                 job_tag = f"{document_id}_v{version_actual}_generic_analysis"
             
-            # ✅ VALIDACIÓN CRÍTICA: Solo usar queries si están disponibles y son válidas
+            # ✅ VALIDACIÓN EXHAUSTIVA DE QUERIES
             if queries and isinstance(queries, list) and len(queries) > 0:
-                # Validar que cada query tenga la estructura correcta
                 valid_queries = []
-                for query in queries:
-                    if isinstance(query, dict) and 'Text' in query and 'Alias' in query:
-                        # Validar que Text y Alias no estén vacíos
-                        if query['Text'].strip() and query['Alias'].strip():
-                            valid_queries.append(query)
                 
-                if valid_queries:
+                for i, query in enumerate(queries):
+                    # Validar estructura básica
+                    if not isinstance(query, dict):
+                        logger.warning(f"⚠️ Query {i} no es un diccionario")
+                        continue
+                    
+                    # Validar campos requeridos
+                    if 'Text' not in query or 'Alias' not in query:
+                        logger.warning(f"⚠️ Query {i} no tiene campos Text/Alias")
+                        continue
+                    
+                    # Validar contenido
+                    text = query['Text']
+                    alias = query['Alias']
+                    
+                    if not isinstance(text, str) or not isinstance(alias, str):
+                        logger.warning(f"⚠️ Query {i} Text/Alias no son strings")
+                        continue
+                    
+                    if not text.strip() or not alias.strip():
+                        logger.warning(f"⚠️ Query {i} Text/Alias están vacíos")
+                        continue
+                    
+                    # Validar longitud (límites de AWS Textract)
+                    if len(text) > 200 or len(alias) > 100:
+                        logger.warning(f"⚠️ Query {i} excede límites de longitud")
+                        continue
+                    
+                    # Query válida
+                    valid_queries.append({
+                        'Text': text.strip(),
+                        'Alias': alias.strip()
+                    })
+                
+                # Solo usar queries si tenemos al menos una válida
+                if valid_queries and len(valid_queries) > 0:
+                    # Limitar número de queries (máximo de AWS Textract es 15)
+                    if len(valid_queries) > 15:
+                        logger.warning(f"⚠️ Limitando queries de {len(valid_queries)} a 15")
+                        valid_queries = valid_queries[:15]
+                    
                     feature_types.append('QUERIES')
                     queries_config = {'Queries': valid_queries}
+                    
                     logger.info(f"✅ QueriesConfig configurado: {len(valid_queries)} queries válidas")
+                    
+                    # Debug: mostrar queries configuradas
+                    for i, q in enumerate(valid_queries):
+                        logger.debug(f"  Query {i+1}: {q['Alias']} = {q['Text'][:50]}...")
+                        
                 else:
                     logger.warning(f"⚠️ Queries disponibles pero ninguna válida para tipo: {doc_type}")
             else:
@@ -621,9 +661,11 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
                 
         except Exception as query_error:
             logger.error(f"❌ Error configurando queries: {str(query_error)}")
+            import traceback
+            logger.error(f"📍 Query error trace: {traceback.format_exc()}")
             # Continuar sin queries en caso de error
         
-        # ✅ PREPARAR PARÁMETROS DE TEXTRACT
+        # ✅ PREPARAR PARÁMETROS DE TEXTRACT CON VALIDACIÓN FINAL
         textract_params = {
             'DocumentLocation': {
                 'S3Object': {
@@ -639,18 +681,49 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
             }
         }
         
-        # ✅ AGREGAR QUERIES SOLO SI ESTÁN CONFIGURADAS
+        # ✅ AGREGAR QUERIES SOLO SI ESTÁN CONFIGURADAS Y VALIDADAS
         if queries_config:
-            textract_params['QueriesConfig'] = queries_config
-            logger.info(f"✅ QueriesConfig añadido con {len(queries_config['Queries'])} queries")
+            # Validación final antes de agregar
+            try:
+                # Verificar que QueriesConfig tiene la estructura correcta
+                if 'Queries' in queries_config and isinstance(queries_config['Queries'], list):
+                    if len(queries_config['Queries']) > 0:
+                        # Validación final de cada query
+                        final_queries = []
+                        for q in queries_config['Queries']:
+                            if (isinstance(q, dict) and 
+                                'Text' in q and 'Alias' in q and
+                                isinstance(q['Text'], str) and isinstance(q['Alias'], str) and
+                                q['Text'].strip() and q['Alias'].strip()):
+                                final_queries.append(q)
+                        
+                        if final_queries:
+                            textract_params['QueriesConfig'] = {'Queries': final_queries}
+                            logger.info(f"✅ QueriesConfig añadido con {len(final_queries)} queries finales")
+                        else:
+                            logger.warning("⚠️ Todas las queries fallaron validación final")
+                    else:
+                        logger.warning("⚠️ Lista de queries vacía en validación final")
+                else:
+                    logger.warning("⚠️ Estructura de QueriesConfig inválida en validación final")
+                    
+            except Exception as final_validation_error:
+                logger.error(f"❌ Error en validación final de queries: {str(final_validation_error)}")
+                # Remover queries si hay problemas
+                if 'QueriesConfig' in textract_params:
+                    del textract_params['QueriesConfig']
+                    feature_types.remove('QUERIES')
+                    textract_params['FeatureTypes'] = feature_types
         
-        # ✅ VALIDACIÓN FINAL DE PARÁMETROS
-        logger.info(f"🔍 Parámetros de Textract:")
+        # ✅ LOG DE CONFIGURACIÓN FINAL
+        logger.info(f"🔍 Configuración final de Textract:")
         logger.info(f"   - Bucket: {bucket}")
         logger.info(f"   - Key: {key}")
         logger.info(f"   - FeatureTypes: {feature_types}")
         logger.info(f"   - JobTag: {job_tag}")
-        logger.info(f"   - Queries: {'Sí' if queries_config else 'No'}")
+        logger.info(f"   - Queries: {'Sí (' + str(len(textract_params.get('QueriesConfig', {}).get('Queries', []))) + ')' if 'QueriesConfig' in textract_params else 'No'}")
+        logger.info(f"   - SNS Topic: {TEXTRACT_SNS_TOPIC}")
+        logger.info(f"   - Role ARN: {TEXTRACT_ROLE_ARN}")
         
         # ✅ INICIAR TEXTRACT CON MANEJO DE ERRORES MEJORADO
         try:
@@ -665,7 +738,7 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
                 'textract_job_id': job_id,
                 'textract_job_tag': job_tag,
                 'feature_types': feature_types,
-                'queries_count': len(queries_config['Queries']) if queries_config else 0,
+                'queries_count': len(textract_params.get('QueriesConfig', {}).get('Queries', [])),
                 'doc_type': doc_type,
                 'version_info': {
                     'version_actual': version_actual,
@@ -677,7 +750,7 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
             
             update_document_processing_status(
                 document_id, 
-                'textract_iniciado',
+                'textract_iniciado_v3',
                 json.dumps(metadata),
                 tipo_documento=doc_type
             )
@@ -689,7 +762,7 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
                     "job_id": job_id, 
                     "job_tag": job_tag,
                     "feature_types": feature_types,
-                    "queries_count": len(queries_config['Queries']) if queries_config else 0
+                    "queries_count": len(textract_params.get('QueriesConfig', {}).get('Queries', []))
                 }
             )
             
@@ -699,17 +772,32 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
             error_message = str(textract_error)
             logger.error(f"❌ Error específico de Textract: {error_message}")
             
-            # Diagnóstico específico del error
+            # ✅ MANEJO MEJORADO DE ERRORES ESPECÍFICOS
             if "InvalidParameterException" in error_message:
-                logger.error("🔧 Error de parámetros inválidos - Verificando configuración:")
-                logger.error(f"   - SNS Topic: {TEXTRACT_SNS_TOPIC}")
-                logger.error(f"   - Role ARN: {TEXTRACT_ROLE_ARN}")
-                logger.error(f"   - Bucket existe: {bucket}")
-                logger.error(f"   - Key válida: {key}")
+                logger.error("🔧 Error de parámetros inválidos - Analizando causa:")
                 
-                # Intentar sin queries como fallback
-                if queries_config:
-                    logger.info("🔧 Reintentando sin queries...")
+                # Verificar configuración específica
+                config_issues = []
+                
+                if not TEXTRACT_SNS_TOPIC.startswith('arn:aws:sns:'):
+                    config_issues.append(f"SNS Topic malformado: {TEXTRACT_SNS_TOPIC}")
+                
+                if not TEXTRACT_ROLE_ARN.startswith('arn:aws:iam:'):
+                    config_issues.append(f"Role ARN malformado: {TEXTRACT_ROLE_ARN}")
+                
+                if 'QueriesConfig' in textract_params:
+                    queries_count = len(textract_params['QueriesConfig']['Queries'])
+                    if queries_count > 15:
+                        config_issues.append(f"Demasiadas queries: {queries_count} (máximo 15)")
+                
+                if config_issues:
+                    for issue in config_issues:
+                        logger.error(f"   - {issue}")
+                
+                # ✅ FALLBACK INTELIGENTE: Intentar sin queries primero
+                if 'QueriesConfig' in textract_params:
+                    logger.info("🔧 Intentando fallback sin queries...")
+                    
                     fallback_params = textract_params.copy()
                     del fallback_params['QueriesConfig']
                     fallback_params['FeatureTypes'] = ['TABLES', 'FORMS']
@@ -718,7 +806,7 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
                     try:
                         textract_response = textract_client.start_document_analysis(**fallback_params)
                         job_id = textract_response['JobId']
-                        logger.info(f"✅ Textract fallback exitoso: JobId={job_id}")
+                        logger.info(f"✅ Textract fallback sin queries exitoso: JobId={job_id}")
                         
                         # Actualizar con configuración fallback
                         fallback_metadata = {
@@ -728,12 +816,13 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
                             'queries_count': 0,
                             'doc_type': doc_type,
                             'fallback_used': True,
+                            'fallback_reason': 'queries_invalid_parameters',
                             'original_error': error_message
                         }
                         
                         update_document_processing_status(
                             document_id, 
-                            'textract_iniciado_fallback',
+                            'textract_iniciado_fallback_queries',
                             json.dumps(fallback_metadata),
                             tipo_documento=doc_type
                         )
@@ -744,6 +833,7 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
                             datos_procesados={
                                 "job_id": job_id, 
                                 "fallback_used": True,
+                                "fallback_reason": "queries_invalid_parameters",
                                 "original_error": error_message
                             }
                         )
@@ -751,9 +841,80 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
                         return True
                         
                     except Exception as fallback_error:
-                        logger.error(f"❌ Fallback también falló: {str(fallback_error)}")
+                        logger.error(f"❌ Fallback sin queries también falló: {str(fallback_error)}")
+                
+                # ✅ SEGUNDO FALLBACK: Solo TEXT detection
+                logger.info("🔧 Intentando segundo fallback con solo TEXT detection...")
+                
+                text_detection_params = {
+                    'DocumentLocation': {
+                        'S3Object': {
+                            'Bucket': bucket,
+                            'Name': key
+                        }
+                    },
+                    'JobTag': f"{document_id}_v{version_actual}_text_only",
+                    'NotificationChannel': {
+                        'SNSTopicArn': TEXTRACT_SNS_TOPIC,
+                        'RoleArn': TEXTRACT_ROLE_ARN
+                    }
+                }
+                
+                try:
+                    textract_response = textract_client.start_document_text_detection(**text_detection_params)
+                    job_id = textract_response['JobId']
+                    logger.info(f"✅ Textract TEXT detection fallback exitoso: JobId={job_id}")
+                    
+                    # Actualizar con configuración de texto solamente
+                    text_metadata = {
+                        'textract_job_id': job_id,
+                        'textract_job_tag': text_detection_params['JobTag'],
+                        'feature_types': ['TEXT'],
+                        'queries_count': 0,
+                        'doc_type': doc_type,
+                        'fallback_used': True,
+                        'fallback_reason': 'analysis_invalid_parameters',
+                        'fallback_level': 'text_detection_only',
+                        'original_error': error_message
+                    }
+                    
+                    update_document_processing_status(
+                        document_id, 
+                        'textract_iniciado_fallback_text',
+                        json.dumps(text_metadata),
+                        tipo_documento=doc_type
+                    )
+                    
+                    log_document_processing_end(
+                        textract_registro_id, 
+                        estado='completado',
+                        datos_procesados={
+                            "job_id": job_id, 
+                            "fallback_used": True,
+                            "fallback_reason": "analysis_invalid_parameters",
+                            "fallback_level": "text_detection_only"
+                        }
+                    )
+                    
+                    return True
+                    
+                except Exception as text_fallback_error:
+                    logger.error(f"❌ Fallback de TEXT detection también falló: {str(text_fallback_error)}")
             
-            # Si todo falla, usar fallback SQS
+            elif "ThrottlingException" in error_message:
+                logger.error("🔄 Textract está siendo limitado por rate limits")
+                # Podríamos implementar retry con backoff aquí
+                
+            elif "LimitExceededException" in error_message:
+                logger.error("📊 Se excedieron los límites de Textract")
+                
+            elif "AccessDenied" in error_message:
+                logger.error("🔐 Error de permisos en Textract")
+                logger.error(f"   - Verificar permisos del rol: {TEXTRACT_ROLE_ARN}")
+                logger.error(f"   - Verificar acceso al bucket: {bucket}")
+                
+            # ✅ ÚLTIMO RECURSO: Fallback completo al procesamiento sin Textract
+            logger.info("🔧 Todos los fallbacks de Textract fallaron, usando fallback completo...")
             raise textract_error
         
     except Exception as e:
@@ -765,8 +926,10 @@ def start_textract_processing(document_id, bucket, key, document_type_info=None,
             mensaje_error=str(e)
         )
         
-        # Fallback: enviar sin Textract
+        # ✅ FALLBACK FINAL: Enviar a clasificación sin Textract
+        logger.info("📤 Enviando a procesamiento sin Textract como último recurso...")
         return send_to_classification_fallback(document_id, bucket, key, preliminary_classification)
+
 
 def send_to_classification_without_textract(document_id, bucket, key, preliminary_classification):
     """
