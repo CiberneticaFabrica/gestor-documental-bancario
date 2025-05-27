@@ -231,12 +231,12 @@ def get_id_document_queries():
     """
     queries = [
         {
-            'Text': 'Cual es el nombre completo de la persona',
+            'Text': 'What is the full name',
             'Alias': 'nombre_completo'
         },
         {
-            'Text': 'Cual es el numero del documento',
-            'Alias': 'numero_documento'
+            'Text': 'What is the full last name',
+            'Alias': 'apellido_completo'
         },
         {
             'Text': 'Cual es la fecha de nacimiento',

@@ -2050,13 +2050,529 @@ def extract_name_from_document(text, document_type=None):
     result = extract_name_universal(text, document_type)
     return result['nombre_completo'] if result else None
 
+def validar_fecha(fecha: str) -> bool:
+    formatos = ["%d-%b-%Y", "%d-%B-%Y", "%d-%m-%Y", "%Y-%m-%d"]
+    for fmt in formatos:
+        try:
+            datetime.strptime(fecha.strip(), fmt)
+            return True
+        except:
+            continue
+    return False
+
+def elegir_nombre(nombre_q, apellido_q, nombre_extraido):
+    if nombre_q and apellido_q and apellido_q.lower() not in nombre_q.lower():
+        combinado = f"{nombre_q} {apellido_q}".strip()
+    else:
+        combinado = nombre_q or ""
+
+    if nombre_extraido and len(nombre_extraido.split()) > len(combinado.split()):
+        logger.info(f"Nombre más completo encontrado en texto: {nombre_extraido}")
+        return nombre_extraido.strip()
+    
+    return combinado or nombre_extraido
+
+def elegir_valor(valor_q, valor_texto, campo, validacion=None):
+    if validacion:
+        if validacion(valor_q):
+            return valor_q
+        elif validacion(valor_texto):
+            logger.info(f"{campo} del texto validado mejor que query.")
+            return valor_texto
+    else:
+        if valor_q:
+            return valor_q
+        elif valor_texto:
+            logger.info(f"{campo} tomado del texto porque no se encontró en query.")
+            return valor_texto
+    return None
+
+def reconciliar_datos_identidad(query_answers, texto_extraido_dict):
+    resultado = {}
+
+    resultado["nombre_completo"] = elegir_nombre(
+        query_answers.get("nombre_completo", {}).get("answer"),
+        query_answers.get("apellido_completo", {}).get("answer"),
+        texto_extraido_dict.get("nombre_completo")
+    )
+
+    resultado["sexo"] = elegir_valor(
+        query_answers.get("sexo", {}).get("answer"),
+        texto_extraido_dict.get("sexo"),
+        "sexo",
+        lambda x: x not in [None, "NC", "N/A", ""]
+    )
+
+    resultado["fecha_nacimiento"] = elegir_valor(
+        query_answers.get("fecha_nacimiento", {}).get("answer"),
+        texto_extraido_dict.get("fecha_nacimiento"),
+        "fecha_nacimiento",
+        validar_fecha
+    )
+
+    resultado["fecha_expedicion"] = elegir_valor(
+        query_answers.get("fecha_expedicion", {}).get("answer"),
+        texto_extraido_dict.get("fecha_emision"),  # puede venir como emision
+        "fecha_expedicion",
+        validar_fecha
+    )
+
+    resultado["lugar_nacimiento"] = elegir_valor(
+        query_answers.get("lugar_nacimiento", {}).get("answer"),
+        texto_extraido_dict.get("lugar_nacimiento"),
+        "lugar_nacimiento"
+    )
+
+    return resultado
+
+def reconcile_identity_data(extracted_data, metadatos_extraccion):
+    """
+    Reconcilia datos extraídos del texto con query_answers de metadatos.
+    Prioriza los datos más completos y precisos.
+    
+    Args:
+        extracted_data (dict): Datos extraídos directamente del texto OCR
+        metadatos_extraccion (dict): Metadatos que incluyen query_answers
+    
+    Returns:
+        dict: Datos reconciliados con los mejores valores disponibles
+    """
+    
+    # Obtener query_answers de metadatos
+    query_answers = {}
+    if isinstance(metadatos_extraccion, dict):
+        query_answers = metadatos_extraccion.get('query_answers', {})
+    elif isinstance(metadatos_extraccion, str):
+        try:
+            metadatos_dict = json.loads(metadatos_extraccion)
+            query_answers = metadatos_dict.get('query_answers', {})
+        except json.JSONDecodeError:
+            logger.warning("No se pudo decodificar metadatos_extraccion")
+            query_answers = {}
+    
+    if not query_answers:
+        logger.info("No hay query_answers disponibles, usando solo datos extraídos del texto")
+        return extracted_data
+    
+    logger.info("🔄 Iniciando reconciliación de datos...")
+    
+    # Crear copia de datos extraídos para modificar
+    reconciled_data = extracted_data.copy()
+    
+    # ==================== RECONCILIACIÓN DE NOMBRES ====================
+    
+    nombre_completo_final = reconcile_full_name(
+        extracted_data.get('nombre_completo'),
+        query_answers.get('nombre_completo', {}).get('answer'),
+        query_answers.get('apellido_completo', {}).get('answer'),
+        query_answers.get('nombre_completo', {}).get('confidence', 0),
+        query_answers.get('apellido_completo', {}).get('confidence', 0)
+    )
+    
+    if nombre_completo_final:
+        reconciled_data['nombre_completo'] = nombre_completo_final
+        
+        # Intentar separar nombres y apellidos del nombre completo final
+        name_parts = split_full_name(nombre_completo_final)
+        if name_parts:
+            reconciled_data['nombre'] = name_parts.get('nombres')
+            reconciled_data['apellidos'] = name_parts.get('apellidos')
+    
+    # ==================== RECONCILIACIÓN DE OTROS CAMPOS ====================
+    
+    # Sexo/Género
+    reconciled_data['genero'] = reconcile_simple_field(
+        extracted_data.get('genero'),
+        query_answers.get('sexo', {}).get('answer'),
+        'género',
+        validator=lambda x: x in ['M', 'F', 'NC'] if x else False
+    )
+    
+    # Fecha de nacimiento
+    reconciled_data['fecha_nacimiento'] = reconcile_date_field(
+        extracted_data.get('fecha_nacimiento'),
+        query_answers.get('fecha_nacimiento', {}).get('answer'),
+        'fecha_nacimiento'
+    )
+    
+    # Fecha de expedición/emisión
+    fecha_expedicion_query = query_answers.get('fecha_expedicion', {}).get('answer')
+    reconciled_data['fecha_emision'] = reconcile_date_field(
+        extracted_data.get('fecha_emision'),
+        fecha_expedicion_query,
+        'fecha_expedicion'
+    )
+    
+    # Lugar de nacimiento
+    reconciled_data['lugar_nacimiento'] = reconcile_simple_field(
+        extracted_data.get('lugar_nacimiento'),
+        query_answers.get('lugar_nacimiento', {}).get('answer'),
+        'lugar_nacimiento',
+        validator=lambda x: len(x) > 2 if x else False
+    )
+    
+    # ==================== VALIDACIÓN FINAL ====================
+    
+    # Asegurar coherencia de número de identificación
+    if not reconciled_data.get('numero_identificacion'):
+        # Intentar extraer de entidades detectadas
+        numero_inferido = extract_id_from_text_or_entities(extracted_data.get('texto_completo', ''))
+        if numero_inferido:
+            reconciled_data['numero_identificacion'] = numero_inferido
+            logger.info(f"📝 Número de identificación inferido: {numero_inferido}")
+    
+    # Log de cambios realizados
+    log_reconciliation_changes(extracted_data, reconciled_data)
+    
+    return reconciled_data
+
+
+def reconcile_full_name(texto_name, query_nombre, query_apellido, conf_nombre=0, conf_apellido=0):
+    """
+    Reconcilia el nombre completo priorizando la información más completa.
+    """
+    
+    # Limpiar valores
+    texto_name = clean_name_value(texto_name)
+    query_nombre = clean_name_value(query_nombre)
+    query_apellido = clean_name_value(query_apellido)
+    
+    logger.info(f"🔍 Reconciliando nombres:")
+    logger.info(f"   Texto OCR: '{texto_name}'")
+    logger.info(f"   Query nombre: '{query_nombre}' (conf: {conf_nombre})")
+    logger.info(f"   Query apellido: '{query_apellido}' (conf: {conf_apellido})")
+    
+    # Caso 1: Si tenemos nombre Y apellido separados en queries con buena confianza
+    if query_nombre and query_apellido and conf_nombre >= 50 and conf_apellido >= 50:
+        # Verificar que no sean duplicados
+        if not names_are_duplicated(query_nombre, query_apellido):
+            combined = f"{query_nombre} {query_apellido}".strip()
+            logger.info(f"✅ Usando combinación de queries: '{combined}'")
+            return combined
+        else:
+            logger.warning("⚠️ Nombres duplicados en queries, usando solo nombre")
+            if len(query_nombre) > len(query_apellido):
+                return query_nombre
+            else:
+                return query_apellido
+    
+    # Caso 2: Solo tenemos nombre completo de query con buena confianza
+    if query_nombre and conf_nombre >= 70:
+        # Comparar longitud con texto extraído
+        if not texto_name or len(query_nombre.split()) >= len(texto_name.split()):
+            logger.info(f"✅ Usando nombre de query (más completo): '{query_nombre}'")
+            return query_nombre
+    
+    # Caso 3: El texto extraído es más completo que las queries
+    if texto_name:
+        texto_words = len(texto_name.split())
+        query_words = len(query_nombre.split()) if query_nombre else 0
+        
+        if texto_words > query_words and texto_words >= 3:
+            logger.info(f"✅ Usando nombre del texto (más completo): '{texto_name}'")
+            return texto_name
+    
+    # Caso 4: Fallback - usar el que tengamos disponible
+    if query_nombre and conf_nombre >= 50:
+        logger.info(f"✅ Fallback a query nombre: '{query_nombre}'")
+        return query_nombre
+    
+    if texto_name:
+        logger.info(f"✅ Fallback a texto: '{texto_name}'")
+        return texto_name
+    
+    logger.warning("❌ No se pudo determinar nombre completo")
+    return None
+
+
+def reconcile_simple_field(texto_value, query_value, field_name, validator=None):
+    """
+    Reconcilia un campo simple priorizando el valor más confiable.
+    """
+    
+    # Limpiar valores
+    texto_clean = texto_value.strip() if texto_value else None
+    query_clean = query_value.strip() if query_value else None
+    
+    # Si tenemos validador, usarlo
+    if validator:
+        texto_valid = validator(texto_clean) if texto_clean else False
+        query_valid = validator(query_clean) if query_clean else False
+        
+        if query_valid and not texto_valid:
+            logger.info(f"🔄 {field_name}: Query válido '{query_clean}' vs texto inválido '{texto_clean}'")
+            return query_clean
+        elif texto_valid and not query_valid:
+            logger.info(f"🔄 {field_name}: Texto válido '{texto_clean}' vs query inválido '{query_clean}'")
+            return texto_clean
+        elif query_valid and texto_valid:
+            # Ambos válidos, preferir query si no son iguales
+            if query_clean != texto_clean:
+                logger.info(f"🔄 {field_name}: Ambos válidos, prefiriendo query '{query_clean}'")
+                return query_clean
+    
+    # Sin validador o ambos válidos iguales
+    if query_clean and query_clean not in ['NC', 'N/A', 'NO APLICA']:
+        return query_clean
+    
+    return texto_clean
+
+
+def reconcile_date_field(texto_date, query_date, field_name):
+    """
+    Reconcilia campos de fecha priorizando el formato más válido.
+    """
+    
+    # Normalizar ambas fechas
+    texto_normalized = normalize_date_improved(texto_date) if texto_date else None
+    query_normalized = normalize_date_improved(query_date) if query_date else None
+    
+    logger.info(f"📅 Reconciliando {field_name}:")
+    logger.info(f"   Texto: '{texto_date}' → '{texto_normalized}'")
+    logger.info(f"   Query: '{query_date}' → '{query_normalized}'")
+    
+    # Priorizar la fecha que se pudo normalizar correctamente
+    if query_normalized and not texto_normalized:
+        logger.info(f"✅ Usando fecha de query (normalizada correctamente)")
+        return query_normalized
+    elif texto_normalized and not query_normalized:
+        logger.info(f"✅ Usando fecha de texto (normalizada correctamente)")
+        return texto_normalized
+    elif query_normalized and texto_normalized:
+        # Ambas válidas, comparar si son la misma fecha
+        if query_normalized == texto_normalized:
+            return query_normalized
+        else:
+            # Diferentes fechas válidas, preferir query
+            logger.info(f"⚠️ Fechas diferentes pero válidas, prefiriendo query")
+            return query_normalized
+    
+    # Ninguna se pudo normalizar, retornar la original que tengamos
+    return query_date or texto_date
+
+
+def clean_name_value(name):
+    """Limpia un valor de nombre"""
+    if not name:
+        return None
+    
+    # Convertir a string y limpiar
+    clean = str(name).strip()
+    
+    # Remover caracteres no deseados pero mantener acentos
+    clean = re.sub(r'[^\w\s\-\']', '', clean)
+    
+    # Normalizar espacios
+    clean = re.sub(r'\s+', ' ', clean)
+    
+    # Verificar que tiene contenido válido
+    if len(clean) < 2 or clean.isdigit():
+        return None
+    
+    return clean
+
+
+def names_are_duplicated(nombre, apellido):
+    """
+    Verifica si nombre y apellido contienen información duplicada.
+    """
+    if not nombre or not apellido:
+        return False
+    
+    nombre_words = set(nombre.upper().split())
+    apellido_words = set(apellido.upper().split())
+    
+    # Si hay intersección significativa, son duplicados
+    intersection = nombre_words.intersection(apellido_words)
+    
+    # Si más del 50% de las palabras se repiten, considerarlo duplicado
+    min_words = min(len(nombre_words), len(apellido_words))
+    if min_words > 0 and len(intersection) / min_words > 0.5:
+        return True
+    
+    return False
+
+
+def split_full_name(full_name):
+    """
+    Intenta separar un nombre completo en nombres y apellidos.
+    Asume que los primeros 1-2 elementos son nombres y el resto apellidos.
+    """
+    if not full_name:
+        return None
+    
+    parts = full_name.strip().split()
+    
+    if len(parts) <= 1:
+        return {'nombres': full_name, 'apellidos': None}
+    elif len(parts) == 2:
+        return {'nombres': parts[0], 'apellidos': parts[1]}
+    elif len(parts) == 3:
+        return {'nombres': parts[0], 'apellidos': ' '.join(parts[1:])}
+    else:
+        # 4 o más partes, asumir primeros 2 son nombres
+        return {'nombres': ' '.join(parts[:2]), 'apellidos': ' '.join(parts[2:])}
+
+
+def extract_id_from_text_or_entities(text):
+    """
+    Intenta extraer número de identificación del texto o entidades como último recurso.
+    """
+    if not text:
+        return None
+    
+    # Patrones para diferentes tipos de ID
+    patterns = [
+        r'\b(\d{1,2}-\d{3,4}-\d{1,4})\b',  # Cédula panameña
+        r'\b(\d{8}[A-Z])\b',               # DNI español
+        r'\b([A-Z]{2}\d{7})\b',            # Pasaporte
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    
+    return None
+
+
+def log_reconciliation_changes(original_data, reconciled_data):
+    """
+    Registra los cambios realizados durante la reconciliación.
+    """
+    changes = []
+    
+    key_fields = ['nombre_completo', 'genero', 'fecha_nacimiento', 'fecha_emision', 'lugar_nacimiento']
+    
+    for field in key_fields:
+        original_val = original_data.get(field)
+        reconciled_val = reconciled_data.get(field)
+        
+        if original_val != reconciled_val:
+            changes.append({
+                'field': field,
+                'original': original_val,
+                'reconciled': reconciled_val
+            })
+    
+    if changes:
+        logger.info("🔄 Cambios realizados durante reconciliación:")
+        for change in changes:
+            logger.info(f"   {change['field']}: '{change['original']}' → '{change['reconciled']}'")
+    else:
+        logger.info("✅ No se requirieron cambios durante la reconciliación")
+
+def extract_id_document_data_improved_with_reconciliation(text, entidades=None, metadatos=None):
+    """
+    Versión mejorada que incluye reconciliación con query_answers.
+    """
+    
+    # 1. Extraer datos usando el método existente
+    logger.info("🔍 Extrayendo datos del texto OCR...")
+    extracted_data = extract_id_document_data_improved_core(text, entidades, metadatos)
+    
+    # 2. Reconciliar con query_answers si están disponibles
+    if metadatos:
+        logger.info("🔄 Iniciando reconciliación con query_answers...")
+        extracted_data = reconcile_identity_data(extracted_data, metadatos)
+    else:
+        logger.info("ℹ️ No hay metadatos disponibles para reconciliación")
+    
+    return extracted_data
+
+def validate_cedula_with_queries(id_data, metadatos):
+    """
+    Validación adicional específica para cédulas usando query_answers.
+    """
+    
+    try:
+        # Obtener query_answers
+        if isinstance(metadatos, str):
+            metadatos_dict = json.loads(metadatos)
+        else:
+            metadatos_dict = metadatos
+        
+        query_answers = metadatos_dict.get('query_answers', {})
+        
+        if not query_answers:
+            return id_data
+        
+        logger.info("🔍 Validando cédula con query_answers...")
+        
+        # Verificar coherencia de fechas
+        fecha_nac_query = query_answers.get('fecha_nacimiento', {}).get('answer')
+        fecha_exp_query = query_answers.get('fecha_expedicion', {}).get('answer')
+        
+        if fecha_nac_query and fecha_exp_query:
+            # Asegurar que la fecha de expedición es posterior al nacimiento
+            nac_norm = normalize_date_improved(fecha_nac_query)
+            exp_norm = normalize_date_improved(fecha_exp_query)
+            
+            if nac_norm and exp_norm:
+                try:
+                    from datetime import datetime
+                    nac_dt = datetime.strptime(nac_norm, '%Y-%m-%d')
+                    exp_dt = datetime.strptime(exp_norm, '%Y-%m-%d')
+                    
+                    if exp_dt <= nac_dt:
+                        logger.warning(f"⚠️ Fecha de expedición incoherente: {exp_norm} <= {nac_norm}")
+                        # Mantener solo la fecha de nacimiento que suele ser más confiable
+                        id_data['fecha_emision'] = None
+                except ValueError:
+                    logger.warning("Error validando coherencia de fechas")
+        
+        # Verificar que el número de cédula esté presente
+        if not id_data.get('numero_identificacion'):
+            # Intentar extraer de entidades detectadas o texto
+            numero_inferido = extract_cedula_number_from_entities_or_text(
+                metadatos_dict.get('entidades_detectadas', {}),
+                id_data.get('texto_completo', '')
+            )
+            if numero_inferido:
+                id_data['numero_identificacion'] = numero_inferido
+                logger.info(f"📝 Número de cédula inferido: {numero_inferido}")
+        
+        # Asegurar país de emisión para cédulas panameñas
+        if not id_data.get('pais_emision'):
+            id_data['pais_emision'] = 'Panamá'
+            logger.info("🌍 País de emisión asignado: Panamá")
+        
+        return id_data
+        
+    except Exception as e:
+        logger.error(f"Error en validación de cédula: {str(e)}")
+        return id_data
+
+
+def extract_cedula_number_from_entities_or_text(entidades, texto):
+    """
+    Intenta extraer número de cédula de entidades detectadas o texto.
+    """
+    
+    # Primero intentar con entidades detectadas
+    if isinstance(entidades, dict):
+        phone_numbers = entidades.get('phone', [])
+        for phone in phone_numbers:
+            if re.match(r'^\d{1,2}-\d{3,4}-\d{1,4}$', phone):
+                logger.info(f"📱 Número de cédula encontrado en entidades: {phone}")
+                return phone
+    
+    # Si no se encuentra en entidades, buscar en texto
+    if texto:
+        cedula_match = re.search(r'\b(\d{1,2}-\d{3,4}-\d{1,4})\b', texto)
+        if cedula_match:
+            logger.info(f"📄 Número de cédula encontrado en texto: {cedula_match.group(1)}")
+            return cedula_match.group(1)
+    
+    return None
+
 def lambda_handler(event, context):
     """
-    Función principal CORREGIDA para procesar documentos de identidad
+    Función principal CORREGIDA para procesar documentos de identidad CON RECONCILIACIÓN
     """
     start_time = time.time()
     logger.info("="*80)
-    logger.info("🚀 INICIANDO PROCESAMIENTO DE DOCUMENTO DE IDENTIDAD")
+    logger.info("🚀 INICIANDO PROCESAMIENTO DE DOCUMENTO DE IDENTIDAD CON RECONCILIACIÓN")
     logger.info("="*80)
     logger.info("Evento recibido: " + json.dumps(event))
     
@@ -2073,7 +2589,8 @@ def lambda_handler(event, context):
             'estado': 'sin_procesar',
             'tiempo': 0,
             'tipo_detectado': None,
-            'datos_extraidos': False
+            'datos_extraidos': False,
+            'reconciliacion_aplicada': False
         }
         
         record_start = time.time()
@@ -2091,7 +2608,7 @@ def lambda_handler(event, context):
             # Iniciar registro de procesamiento
             registro_id = log_document_processing_start(
                 document_id, 
-                'procesamiento_identidad_corregido',
+                'procesamiento_identidad_con_reconciliacion',
                 datos_entrada=message_body
             )
             
@@ -2109,9 +2626,9 @@ def lambda_handler(event, context):
             
             logger.info(f"📖 Texto recuperado: {len(extracted_text)} caracteres")
             
-            # ==================== EXTRACCIÓN MEJORADA ====================
+            # ==================== EXTRACCIÓN CON RECONCILIACIÓN ====================
             
-            logger.info(f"🔍 Iniciando extracción de datos de identificación...")
+            logger.info(f"🔍 Iniciando extracción con reconciliación de datos...")
             
             entidades = document_data_result['extracted_data'].get('entidades')
             metadatos = document_data_result['extracted_data'].get('metadatos_extraccion')
@@ -2119,16 +2636,34 @@ def lambda_handler(event, context):
             # Registrar sub-proceso de extracción
             sub_registro_id = log_document_processing_start(
                 document_id, 
-                'extraccion_datos_identidad',
-                datos_entrada={"texto_longitud": len(extracted_text)},
+                'extraccion_datos_identidad_con_reconciliacion',
+                datos_entrada={
+                    "texto_longitud": len(extracted_text),
+                    "tiene_metadatos": bool(metadatos),
+                    "tiene_entidades": bool(entidades)
+                },
                 analisis_id=registro_id
             )
             
-            # ✅ USAR FUNCIÓN CORREGIDA
-            id_data = extract_id_document_data_improved_core(extracted_text, entidades, metadatos)
+            # ✅ UNA SOLA LLAMADA - CON RECONCILIACIÓN INTEGRADA
+            id_data = extract_id_document_data_improved_with_reconciliation(
+                extracted_text, 
+                entidades, 
+                metadatos
+            )
             
             tipo_detectado = id_data.get('tipo_identificacion', 'desconocido')
             documento_detalle['tipo_detectado'] = tipo_detectado
+            
+            # Verificar si se aplicó reconciliación
+            if metadatos:
+                documento_detalle['reconciliacion_aplicada'] = True
+                logger.info("✅ Reconciliación con query_answers aplicada")
+            
+            # Validación adicional para cédulas
+            if tipo_detectado in ['cedula_panama', 'cedula'] and metadatos:
+                logger.info("🔍 Aplicando validación adicional para cédula...")
+                id_data = validate_cedula_with_queries(id_data, metadatos)
             
             # Finalizar registro de extracción
             log_document_processing_end(
@@ -2138,7 +2673,8 @@ def lambda_handler(event, context):
                     "tipo_detectado": tipo_detectado,
                     "numero_extraido": bool(id_data.get('numero_identificacion')),
                     "nombre_extraido": bool(id_data.get('nombre_completo')),
-                    "campos_totales": len([k for k, v in id_data.items() if v is not None])
+                    "campos_totales": len([k for k, v in id_data.items() if v is not None]),
+                    "reconciliacion_aplicada": documento_detalle['reconciliacion_aplicada']
                 }
             )
             
@@ -2154,7 +2690,7 @@ def lambda_handler(event, context):
             if validation['warnings']:
                 logger.warning(f"⚠️ Advertencias: {'; '.join(validation['warnings'])}")
             
-            # ✅ EVALUACIÓN DE CONFIANZA CORREGIDA
+            # Evaluación de confianza
             requires_review = evaluate_confidence(
                 confidence,
                 document_type=tipo_detectado,
@@ -2166,14 +2702,10 @@ def lambda_handler(event, context):
                 response['requieren_revision'] += 1
                 logger.warning(f"⚠️ Documento {document_id} requiere revisión manual")
                 
-                # ✅ MARCAR PARA REVISIÓN MANUAL CORREGIDO
                 try:
-                    # Necesitamos obtener el analysis_id correcto
-                    analysis_id = registro_id  # Usar el registro_id como analysis_id
-                    
                     mark_for_manual_review(
                         document_id=document_id,
-                        analysis_id=analysis_id,
+                        analysis_id=registro_id,
                         confidence=confidence,
                         document_type=tipo_detectado,
                         validation_info=validation,
@@ -2184,18 +2716,15 @@ def lambda_handler(event, context):
             
             # ==================== GUARDAR EN BASE DE DATOS ====================
             
-            # Solo intentar guardar si tenemos datos mínimos válidos
-            #should_save = (
-            #    id_data.get('numero_identificacion') and 
-            #    not id_data['numero_identificacion'].startswith('AUTO-') and
-            #    id_data.get('nombre_completo') and 
-            #    id_data['nombre_completo'] != 'Titular no identificado'
-            #)
-            
+            # Criterios mejorados para guardar (más flexibles después de reconciliación)
             should_save = (
                 id_data.get('numero_identificacion') and 
                 not id_data['numero_identificacion'].startswith('AUTO-')
             )
+            
+            # Si tenemos nombre completo después de reconciliación, es un plus
+            if id_data.get('nombre_completo') and id_data['nombre_completo'] != 'Titular no identificado':
+                logger.info("✅ Nombre completo disponible después de reconciliación")
 
             if should_save:
                 logger.info(f"💾 Guardando datos extraídos en base de datos...")
@@ -2206,12 +2735,12 @@ def lambda_handler(event, context):
                     datos_entrada={
                         "tipo_documento": tipo_detectado,
                         "confidence": confidence,
-                        "valid": validation['is_valid']
+                        "valid": validation['is_valid'],
+                        "reconciliacion_aplicada": documento_detalle['reconciliacion_aplicada']
                     },
                     analisis_id=registro_id
                 )
                 
-                # ✅ USAR FUNCIÓN MEJORADA DE REGISTRO
                 success = register_document_identification_improved(document_id, id_data)
                 
                 if success:
@@ -2219,8 +2748,6 @@ def lambda_handler(event, context):
                     documento_detalle['datos_extraidos'] = True
                     
                     log_document_processing_end(db_registro_id, estado='completado')
-                    
-                    # Mostrar cambios si los hay
                     log_identification_changes(document_id)
                 else:
                     logger.error(f"❌ Error al guardar datos")
@@ -2232,15 +2759,14 @@ def lambda_handler(event, context):
                         mensaje_error="Error al guardar en base de datos"
                     )
             else:
-                logger.warning(f"⚠️ Datos insuficientes para guardar, marcando para revisión manual")
+                logger.warning(f"⚠️ Datos insuficientes para guardar")
                 documento_detalle['estado'] = 'datos_insuficientes'
                 response['requieren_revision'] += 1
                 
-                # Actualizar estado a revisión manual
                 update_document_processing_status(
                     document_id, 
                     'requiere_revision_manual',
-                    f"Datos extraídos insuficientes. Número: {id_data.get('numero_identificacion')}, Nombre: {id_data.get('nombre_completo')}"
+                    f"Datos extraídos insuficientes tras reconciliación. Número: {id_data.get('numero_identificacion')}, Nombre: {id_data.get('nombre_completo')}"
                 )
             
             # ==================== ACTUALIZAR DOCUMENTO PRINCIPAL ====================
@@ -2248,7 +2774,11 @@ def lambda_handler(event, context):
             update_id = log_document_processing_start(
                 document_id, 
                 'actualizar_documento_principal',
-                datos_entrada={"confidence": confidence, "is_valid": validation['is_valid']},
+                datos_entrada={
+                    "confidence": confidence, 
+                    "is_valid": validation['is_valid'],
+                    "reconciliacion_aplicada": documento_detalle['reconciliacion_aplicada']
+                },
                 analisis_id=registro_id
             )
             
@@ -2280,13 +2810,13 @@ def lambda_handler(event, context):
             # Determinar estado final
             if requires_review or not should_save:
                 status = 'requiere_revision_manual'
-                message = "Documento procesado - Requiere revisión manual"
+                message = "Documento procesado con reconciliación - Requiere revisión manual"
             elif validation['is_valid']:
                 status = 'completado'
-                message = "Documento de identidad procesado correctamente"
+                message = "Documento de identidad procesado correctamente con reconciliación"
             else:
                 status = 'completado_con_advertencias'
-                message = "Documento procesado con advertencias"
+                message = "Documento procesado con reconciliación y advertencias"
             
             # Obtener tipo de documento para la actualización de estado
             tipo_doc_map = {
@@ -2302,7 +2832,8 @@ def lambda_handler(event, context):
                 'tipo_detectado': tipo_detectado,
                 'campos_extraídos': [k for k, v in id_data.items() if v is not None],
                 'requires_review': requires_review,
-                'datos_guardados': should_save
+                'datos_guardados': should_save,
+                'reconciliacion_aplicada': documento_detalle['reconciliacion_aplicada']
             }
             
             update_document_processing_status(
@@ -2328,6 +2859,7 @@ def lambda_handler(event, context):
             logger.info(f"   📋 Tipo: {tipo_detectado}")
             logger.info(f"   📊 Confianza: {confidence:.2f}")
             logger.info(f"   📝 Estado: {status}")
+            logger.info(f"   🔄 Reconciliación: {'✅ Aplicada' if documento_detalle['reconciliacion_aplicada'] else '❌ No disponible'}")
             
         except Exception as e:
             error_msg = str(e)
@@ -2344,7 +2876,7 @@ def lambda_handler(event, context):
                     update_document_processing_status(
                         document_id, 
                         'error',
-                        f"Error en procesamiento de identidad: {error_msg}"
+                        f"Error en procesamiento de identidad con reconciliación: {error_msg}"
                     )
                 except:
                     pass
@@ -2365,19 +2897,19 @@ def lambda_handler(event, context):
 
     # ==================== ASIGNAR CARPETA (SOLO SI HAY ÉXITOS) ====================
     
-        if response['procesados'] > 0 or response['requieren_revision'] > 0:
-            # Buscar CUALQUIER documento que haya sido procesado (exitoso o con revisión)
-            last_processed_doc = None
-            for detalle in response['detalles']:
-                if detalle['estado'] in ['procesado', 'requiere_revision', 'datos_insuficientes']:
-                    last_processed_doc = detalle['documento_id']
-                    break
-            
-            if last_processed_doc:
-                cliente_id = get_client_id_by_document(last_processed_doc)
-                if cliente_id:
-                    logger.info(f"👤 Asignando carpeta para documento {last_processed_doc}")
-                    assign_folder_and_link(cliente_id, last_processed_doc)
+    if response['procesados'] > 0 or response['requieren_revision'] > 0:
+        # Buscar CUALQUIER documento que haya sido procesado (exitoso o con revisión)
+        last_processed_doc = None
+        for detalle in response['detalles']:
+            if detalle['estado'] in ['procesado', 'requiere_revision', 'datos_insuficientes']:
+                last_processed_doc = detalle['documento_id']
+                break
+        
+        if last_processed_doc:
+            cliente_id = get_client_id_by_document(last_processed_doc)
+            if cliente_id:
+                logger.info(f"👤 Asignando carpeta para documento {last_processed_doc}")
+                assign_folder_and_link(cliente_id, last_processed_doc)
     
     # ==================== RESUMEN FINAL ====================
     
@@ -2386,15 +2918,19 @@ def lambda_handler(event, context):
     response['total_registros'] = len(event['Records'])
     
     logger.info("="*80)
-    logger.info("📊 RESUMEN DEL PROCESAMIENTO")
+    logger.info("📊 RESUMEN DEL PROCESAMIENTO CON RECONCILIACIÓN")
     logger.info("="*80)
     logger.info(f"✅ Documentos procesados exitosamente: {response['procesados']}")
     logger.info(f"⚠️ Documentos que requieren revisión: {response['requieren_revision']}")
     logger.info(f"❌ Documentos con errores: {response['errores']}")
     logger.info(f"⏱️ Tiempo total: {total_time:.2f} segundos")
     
+    # Mostrar estadísticas de reconciliación
+    documentos_con_reconciliacion = sum(1 for d in response['detalles'] if d.get('reconciliacion_aplicada', False))
+    logger.info(f"🔄 Documentos con reconciliación aplicada: {documentos_con_reconciliacion}")
+    
     if response['procesados'] > 0 or response['requieren_revision'] > 0:
-        logger.info("🎉 Procesamiento completado con resultados")
+        logger.info("🎉 Procesamiento con reconciliación completado con resultados")
     else:
         logger.warning("⚠️ Procesamiento completado SIN documentos exitosos")
     

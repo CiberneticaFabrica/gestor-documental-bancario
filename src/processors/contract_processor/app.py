@@ -24,10 +24,14 @@ from common.db_connector import (
     generate_uuid,
     link_document_to_client,
     assign_folder_and_link,
-    get_client_id_by_document
+    get_client_id_by_document,
+    log_document_processing_start,
+    log_document_processing_end,
+    log_contract_changes,
+    register_bank_contract
 )
  
-from contract_parser import extract_contract_data, validate_contract_data, format_date, extract_clauses_by_section
+from contract_parser import extract_contract_data, validate_contract_data, format_date, extract_clauses_by_section, generate_contract_summary
 
 # Configurar el logger
 logger = logging.getLogger()
@@ -195,6 +199,18 @@ def process_contract_data(document_id, extracted_data):
                         existing_firmantes.append(firmante)
                 contract_data['firmantes'] = existing_firmantes
         
+        # ❌ ELIMINAR ESTA LÍNEA - Ya se llamó arriba
+        # contract_data = extract_contract_data(full_text, text_blocks)
+
+        # ✅ ESTO ESTÁ BIEN - Generar resumen del contrato
+        contract_summary = generate_contract_summary(contract_data)
+        contract_data['resumen_ejecutivo'] = contract_summary
+        logger.info(f"📄 Resumen del contrato: {contract_summary}")
+
+        # ✅ ESTO ESTÁ BIEN - Agregar resumen a observaciones si no hay
+        if not contract_data.get('observaciones'):
+            contract_data['observaciones'] = f"Resumen: {contract_summary}"
+
         # Extraer cláusulas importantes y términos
         clause_sections = extract_clauses_by_section(full_text)
         if clause_sections:
@@ -408,18 +424,22 @@ def save_contract_data_to_db(document_id, contract_data, validation, operation_t
         }
 
 
+# Modificar la función lambda_handler en contract_processor/app.py
 def lambda_handler(event, context):
     """
     Función principal que procesa contratos bancarios.
-    Optimizada para trabajar con datos ya extraídos por textract_callback.
-    Se activa por mensajes de la cola SQS de contratos.
+    VERSIÓN MEJORADA que registra en la tabla contratos_bancarios
     """
     start_time = time.time()
+    logger.info("="*80)
+    logger.info("🚀 INICIANDO PROCESAMIENTO DE CONTRATO BANCARIO")
+    logger.info("="*80)
     logger.info("Evento recibido: " + json.dumps(event))
     
     response = {
         'procesados': 0,
         'errores': 0,
+        'requieren_revision': 0,
         'detalles': []
     }
 
@@ -427,51 +447,103 @@ def lambda_handler(event, context):
         documento_detalle = {
             'documento_id': None,
             'estado': 'sin_procesar',
-            'tiempo': 0
+            'tiempo': 0,
+            'tipo_detectado': None,
+            'datos_extraidos': False
         }
         
         record_start = time.time()
+        registro_id = None
         
         try:
+            # Parsear mensaje
             message_body = json.loads(record['body'])
             document_id = message_body['document_id']
             documento_detalle['documento_id'] = document_id
             
-            logger.info(f"Procesando contrato {document_id}")
+            logger.info(f"📄 Procesando contrato {document_id}")
             
-     
+            # Iniciar registro de procesamiento
+            registro_id = log_document_processing_start(
+                document_id, 
+                'procesamiento_contrato',
+                datos_entrada=message_body
+            )
             
+            # Obtener datos de la BD
+            logger.info(f"📥 Recuperando datos extraídos de la base de datos...")
             document_data_result = get_extracted_data_from_db(document_id)
             
-            # Obtener tipo_documento si existe
-            tipo_detectado = document_data_result['extracted_data'].get('tipo_documento_detectado', 'contrato')
-
-            # Asignar carpeta y marcar documento solicitado como recibido
-            cliente_id = get_client_id_by_document(document_id)
-            assign_folder_and_link(cliente_id,document_id)
-            logger.info(f"Procesando contrato Asignar carpeta y marcar documento solicitado como recibido {document_id}")
-
             if not document_data_result:
-                logger.error(f"No se pudieron recuperar datos del documento {document_id}")
-                documento_detalle['estado'] = 'error_recuperacion_datos'
-                response['errores'] += 1
-                continue
+                raise Exception(f"No se pudieron recuperar datos del documento {document_id}")
             
+            # Obtener tipo detectado si existe
+            tipo_detectado = document_data_result['extracted_data'].get('tipo_documento_detectado', 'contrato')
+            documento_detalle['tipo_detectado'] = tipo_detectado
+            
+            # Procesar datos del contrato
+            logger.info(f"🔍 Procesando datos del contrato...")
             process_result = process_contract_data(
                 document_id, 
                 document_data_result['extracted_data']
             )
             
             if not process_result['success']:
-                logger.error(f"Error al procesar datos de contrato: {process_result.get('error')}")
-                documento_detalle['estado'] = 'error_procesamiento'
-                documento_detalle['error'] = process_result.get('error')
-                response['errores'] += 1
-                continue
+                raise Exception(f"Error al procesar datos de contrato: {process_result.get('error')}")
             
             contract_data = process_result['contract_data']
             validation = process_result['validation']
             
+            logger.info(f"📊 Validación completada - Confianza: {validation['confidence']:.2f}")
+            
+            # Evaluar si requiere revisión manual
+            requires_review = evaluate_confidence(
+                validation['confidence'],
+                document_type='contrato',
+                validation_results=validation
+            )
+            
+            if requires_review:
+                documento_detalle['estado'] = 'requiere_revision'
+                response['requieren_revision'] += 1
+                logger.warning(f"⚠️ Documento {document_id} requiere revisión manual")
+            
+            # NUEVO: Registrar en tabla contratos_bancarios
+            should_save = True
+            if not contract_data.get('numero_contrato'):
+                logger.warning(f"⚠️ No se encontró número de contrato")
+                should_save = False
+            
+            if should_save:
+                logger.info(f"💾 Guardando datos del contrato en tabla contratos_bancarios...")
+                
+                # Agregar observaciones basadas en la validación
+                observaciones = []
+                if validation.get('warnings'):
+                    observaciones.extend(validation['warnings'])
+                if validation.get('errors'):
+                    observaciones.extend([f"ERROR: {e}" for e in validation['errors']])
+                
+                contract_data['observaciones'] = '; '.join(observaciones) if observaciones else None
+                
+                # Registrar en tabla contratos_bancarios
+                success = register_bank_contract(document_id, contract_data)
+                
+                if success:
+                    logger.info(f"✅ Contrato guardado exitosamente en contratos_bancarios")
+                    documento_detalle['datos_extraidos'] = True
+                    
+                    # Mostrar cambios si los hay
+                    log_contract_changes(document_id)
+                else:
+                    logger.error(f"❌ Error al guardar contrato en tabla específica")
+                    documento_detalle['error_guardado'] = "Falló el guardado en contratos_bancarios"
+            else:
+                logger.warning(f"⚠️ Datos insuficientes para guardar en contratos_bancarios")
+                documento_detalle['estado'] = 'datos_insuficientes'
+                response['requieren_revision'] += 1
+            
+            # Guardar datos generales del documento
             save_result = save_contract_data_to_db(
                 document_id,
                 contract_data,
@@ -480,20 +552,13 @@ def lambda_handler(event, context):
             )
             
             if save_result['success']:
-                logger.info(f"Datos de contrato guardados correctamente para {document_id}")
+                logger.info(f"✅ Datos generales guardados correctamente para {document_id}")
                 documento_detalle['estado'] = 'procesado_completo'
                 documento_detalle['confianza'] = validation.get('confidence', 0.0)
                 response['procesados'] += 1
-
-                # ⚠️ Evaluar si requiere revisión manual
-                requires_review = evaluate_confidence(
-                    validation['confidence'],
-                    document_type='contrato',
-                    validation_results=validation
-                )
-
+                
+                # Marcar para revisión manual si es necesario
                 if requires_review:
-                    logger.warning(f"Documento {document_id} marcado para revisión manual.")
                     mark_for_manual_review(
                         document_id=document_id,
                         analysis_id=save_result.get('analysis_id'),
@@ -502,40 +567,124 @@ def lambda_handler(event, context):
                         validation_info=validation,
                         extracted_data=contract_data
                     )
+            
+            # Actualizar estado final
+            if documento_detalle['estado'] == 'sin_procesar':
+                documento_detalle['estado'] = 'procesado'
+                
+            # Determinar estado final
+            if requires_review or not should_save:
+                status = 'requiere_revision_manual'
+                message = "Contrato procesado - Requiere revisión manual"
+            elif validation['is_valid']:
+                status = 'completado'
+                message = "Contrato bancario procesado correctamente"
             else:
-                logger.error(f"Error al guardar datos de contrato: {save_result.get('error')}")
-                documento_detalle['estado'] = 'error_guardado'
-                documento_detalle['error'] = save_result.get('error')
-                response['errores'] += 1
-
-        except json.JSONDecodeError as json_error:
-            logger.error(f"Error al decodificar mensaje SQS: {str(json_error)}")
-            documento_detalle['estado'] = 'error_formato_json'
-            documento_detalle['error'] = str(json_error)
-            response['errores'] += 1
-        except KeyError as key_error:
-            logger.error(f"Falta campo requerido en mensaje: {str(key_error)}")
-            documento_detalle['estado'] = 'error_campo_faltante'
-            documento_detalle['error'] = str(key_error) 
-            response['errores'] += 1
+                status = 'completado_con_advertencias'
+                message = "Contrato procesado con advertencias"
+            
+            final_details = {
+                'validación': validation,
+                'tipo_contrato': contract_data.get('tipo_contrato'),
+                'numero_contrato': contract_data.get('numero_contrato'),
+                'campos_extraídos': [k for k, v in contract_data.items() if v is not None],
+                'requires_review': requires_review,
+                'datos_guardados': should_save
+            }
+            
+            update_document_processing_status(
+                document_id, 
+                status, 
+                json.dumps(final_details, ensure_ascii=False),
+                tipo_documento='Contrato'
+            )
+            
+            documento_detalle['confianza'] = validation['confidence']
+            documento_detalle['estado_final'] = status
+            
+            # Finalizar registro principal
+            log_document_processing_end(
+                registro_id, 
+                estado='completado',
+                confianza=validation['confidence'],
+                datos_salida=final_details,
+                mensaje_error=None if validation['is_valid'] else "Procesado con advertencias"
+            )
+            
+            logger.info(f"✅ Documento {document_id} procesado completamente")
+            logger.info(f"   📋 Tipo contrato: {contract_data.get('tipo_contrato')}")
+            logger.info(f"   📊 Confianza: {validation['confidence']:.2f}")
+            logger.info(f"   📝 Estado: {status}")
+                
         except Exception as e:
-            logger.error(f"Error general al procesar mensaje: {str(e)}")
+            error_msg = str(e)
+            logger.error(f"❌ Error procesando contrato {document_id if 'document_id' in locals() else 'DESCONOCIDO'}: {error_msg}")
             logger.error(traceback.format_exc())
-            documento_detalle['estado'] = 'error_general'
-            documento_detalle['error'] = str(e)
+            
+            documento_detalle['estado'] = 'error'
+            documento_detalle['error'] = error_msg
             response['errores'] += 1
+            
+            # Actualizar estado de error
+            if 'document_id' in locals():
+                try:
+                    update_document_processing_status(
+                        document_id, 
+                        'error',
+                        f"Error en procesamiento de contrato: {error_msg}"
+                    )
+                except:
+                    pass
+            
+            # Finalizar registro con error
+            if registro_id:
+                log_document_processing_end(
+                    registro_id, 
+                    estado='error',
+                    mensaje_error=error_msg
+                )
+                
         finally:
-            documento_detalle['tiempo'] = time.time() - record_start
+            # Calcular tiempo de procesamiento
+            tiempo_procesamiento = time.time() - record_start
+            documento_detalle['tiempo'] = tiempo_procesamiento
             response['detalles'].append(documento_detalle)
 
+    # Asignar carpeta (solo si hay éxitos)
+    if response['procesados'] > 0 or response['requieren_revision'] > 0:
+        # Buscar CUALQUIER documento que haya sido procesado
+        last_processed_doc = None
+        for detalle in response['detalles']:
+            if detalle['estado'] in ['procesado', 'procesado_completo', 'requiere_revision', 'datos_insuficientes']:
+                last_processed_doc = detalle['documento_id']
+                break
+        
+        if last_processed_doc:
+            cliente_id = get_client_id_by_document(last_processed_doc)
+            if cliente_id:
+                logger.info(f"👤 Asignando carpeta para documento {last_processed_doc}")
+                assign_folder_and_link(cliente_id, last_processed_doc)
+    
+    # Resumen final
     total_time = time.time() - start_time
     response['tiempo_total'] = total_time
     response['total_registros'] = len(event['Records'])
-
-    logger.info(f"Procesamiento completado: {response['procesados']} exitosos, {response['errores']} errores en {total_time:.2f} segundos")
-
+    
+    logger.info("="*80)
+    logger.info("📊 RESUMEN DEL PROCESAMIENTO DE CONTRATOS")
+    logger.info("="*80)
+    logger.info(f"✅ Contratos procesados exitosamente: {response['procesados']}")
+    logger.info(f"⚠️ Contratos que requieren revisión: {response['requieren_revision']}")
+    logger.info(f"❌ Contratos con errores: {response['errores']}")
+    logger.info(f"⏱️ Tiempo total: {total_time:.2f} segundos")
+    
+    if response['procesados'] > 0 or response['requieren_revision'] > 0:
+        logger.info("🎉 Procesamiento completado con resultados")
+    else:
+        logger.warning("⚠️ Procesamiento completado SIN contratos exitosos")
+    
     return {
         'statusCode': 200,
-        'body': json.dumps(response)
+        'body': json.dumps(response, ensure_ascii=False)
     }
  

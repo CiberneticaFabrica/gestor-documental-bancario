@@ -8,7 +8,7 @@ import uuid
 import re
 from datetime import datetime
 import boto3
-
+ 
 # Configuración del logger
 logger = logging.getLogger()
 logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
@@ -3138,3 +3138,263 @@ def migrate_analysis_without_version():
     except Exception as e:
         logger.error(f"Error en migración de análisis: {str(e)}")
         return -1    
+    
+# Agregar esta función en db_connector.py
+
+def register_bank_contract(document_id, contract_data):
+    """
+    Registra o actualiza datos de contratos bancarios en la tabla contratos_bancarios
+    """
+    try:
+        # Validar datos mínimos requeridos
+        required_fields = ['tipo_contrato', 'numero_contrato', 'fecha_inicio', 'estado']
+        missing_fields = []
+        
+        for field in required_fields:
+            if not contract_data.get(field):
+                missing_fields.append(field)
+        
+        if missing_fields:
+            logger.error(f"❌ Campos requeridos faltantes para contrato bancario: {missing_fields}")
+            return False
+        
+        # Mapear tipo de contrato al enum de la tabla
+        tipo_contrato_map = {
+            'cuenta_corriente': 'cuenta_corriente',
+            'cuenta_ahorro': 'cuenta_ahorro',
+            'deposito': 'deposito',
+            'prestamo': 'prestamo',
+            'hipoteca': 'hipoteca',
+            'tarjeta_credito': 'tarjeta_credito',
+            'inversion': 'inversion',
+            'seguro': 'seguro',
+            'otro': 'otro'
+        }
+        
+        tipo_contrato = tipo_contrato_map.get(contract_data.get('tipo_contrato'), 'otro')
+        
+        # Mapear estados
+        estado_map = {
+            'vigente': 'vigente',
+            'cancelado': 'cancelado',
+            'suspendido': 'suspendido',
+            'pendiente_firma': 'pendiente_firma',
+            'vencido': 'vencido'
+        }
+        
+        estado = estado_map.get(contract_data.get('estado'), 'pendiente_firma')
+        
+        # Formatear fechas
+        fecha_inicio = contract_data.get('fecha_inicio_iso') or contract_data.get('fecha_inicio')
+        fecha_fin = contract_data.get('fecha_fin_iso') or contract_data.get('fecha_fin')
+        
+        # Validar formato de fechas
+        if fecha_inicio and not re.match(r'^\d{4}-\d{2}-\d{2}$', str(fecha_inicio)):
+            # Intentar convertir
+            fecha_inicio = format_date(fecha_inicio)
+        
+        if fecha_fin and not re.match(r'^\d{4}-\d{2}-\d{2}$', str(fecha_fin)):
+            fecha_fin = format_date(fecha_fin)
+        
+        # Verificar si ya existe un registro
+        check_query = """
+        SELECT id_documento FROM contratos_bancarios WHERE id_documento = %s
+        """
+        existing = execute_query(check_query, (document_id,))
+        
+        if existing:
+            # Preservar datos antes de actualizar
+            logger.info(f"📸 Preservando datos existentes del contrato antes de actualizar")
+            try:
+                preserve_contract_data(document_id, reason="Actualización con nuevos datos extraídos")
+            except Exception as preserve_error:
+                logger.warning(f"⚠️ Error al preservar datos: {str(preserve_error)}")
+            
+            # Actualizar registro existente
+            query = """
+            UPDATE contratos_bancarios 
+            SET tipo_contrato = %s,
+                numero_contrato = %s,
+                fecha_inicio = %s,
+                fecha_fin = %s,
+                estado = %s,
+                valor_contrato = %s,
+                tasa_interes = %s,
+                periodo_tasa = %s,
+                moneda = %s,
+                numero_producto = %s,
+                firmado_digitalmente = %s,
+                fecha_ultima_revision = NOW(),
+                revisado_por = %s,
+                observaciones = %s
+            WHERE id_documento = %s
+            """
+            params = (
+                tipo_contrato,
+                contract_data.get('numero_contrato'),
+                fecha_inicio,
+                fecha_fin,
+                estado,
+                contract_data.get('valor_contrato'),
+                contract_data.get('tasa_interes'),
+                contract_data.get('periodo_tasa', 'anual'),
+                contract_data.get('moneda', 'EUR'),
+                contract_data.get('numero_producto'),
+                contract_data.get('firmado_digitalmente', False),
+                '691d8c44-f524-48fd-b292-be9e31977711',  # Usuario sistema
+                contract_data.get('observaciones'),
+                document_id
+            )
+            operation = "ACTUALIZACIÓN"
+        else:
+            # Insertar nuevo registro
+            query = """
+            INSERT INTO contratos_bancarios (
+                id_documento,
+                tipo_contrato,
+                numero_contrato,
+                fecha_inicio,
+                fecha_fin,
+                estado,
+                valor_contrato,
+                tasa_interes,
+                periodo_tasa,
+                moneda,
+                numero_producto,
+                firmado_digitalmente,
+                fecha_ultima_revision,
+                revisado_por,
+                observaciones
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s)
+            """
+            params = (
+                document_id,
+                tipo_contrato,
+                contract_data.get('numero_contrato'),
+                fecha_inicio,
+                fecha_fin,
+                estado,
+                contract_data.get('valor_contrato'),
+                contract_data.get('tasa_interes'),
+                contract_data.get('periodo_tasa', 'anual'),
+                contract_data.get('moneda', 'EUR'),
+                contract_data.get('numero_producto'),
+                contract_data.get('firmado_digitalmente', False),
+                '691d8c44-f524-48fd-b292-be9e31977711',  # Usuario sistema
+                contract_data.get('observaciones')
+            )
+            operation = "INSERCIÓN"
+        
+        logger.info(f"🔍 {operation} para {tipo_contrato.upper()}")
+        logger.info(f"📝 Número contrato: {contract_data.get('numero_contrato')}")
+        logger.info(f"📅 Vigencia: {fecha_inicio} → {fecha_fin}")
+        logger.info(f"💰 Valor: {contract_data.get('valor_contrato')} {contract_data.get('moneda', 'EUR')}")
+        logger.info(f"📊 Tasa: {contract_data.get('tasa_interes')}%")
+        logger.info(f"🏦 Producto: {contract_data.get('numero_producto')}")
+        
+        # Ejecutar la consulta
+        execute_query(query, params, fetch=False)
+        
+        # Verificar éxito
+        verify_query = """
+        SELECT numero_contrato, tipo_contrato, estado 
+        FROM contratos_bancarios 
+        WHERE id_documento = %s
+        """
+        verify_result = execute_query(verify_query, (document_id,))
+        
+        if verify_result and len(verify_result) > 0:
+            saved_data = verify_result[0]
+            logger.info(f"✅ {operation} exitosa verificada:")
+            logger.info(f"   📝 Número guardado: {saved_data.get('numero_contrato')}")
+            logger.info(f"   📋 Tipo guardado: {saved_data.get('tipo_contrato')}")
+            logger.info(f"   🔄 Estado guardado: {saved_data.get('estado')}")
+            return True
+        else:
+            logger.error(f"❌ Verificación falló: No se encontraron datos guardados")
+            return False
+            
+    except Exception as e:
+        logger.error(f"❌ Error en registro de contrato bancario: {str(e)}")
+        logger.error(f"📊 Datos que se intentaban guardar:")
+        logger.error(f"   Tipo: {contract_data.get('tipo_contrato')}")
+        logger.error(f"   Número: {contract_data.get('numero_contrato')}")
+        logger.error(f"   Estado: {contract_data.get('estado')}")
+        
+        return False
+
+def preserve_contract_data(document_id, reason="Manual preservation"):
+    """
+    Preserva los datos actuales de un contrato antes de una actualización
+    """
+    try:
+        # Obtener datos actuales del contrato
+        query = """
+        SELECT * FROM contratos_bancarios
+        WHERE id_documento = %s
+        """
+        
+        contract_data = execute_query(query, (document_id,))
+        
+        if not contract_data:
+            logger.warning(f"No se encontraron datos de contrato para documento {document_id}")
+            return False
+        
+        current_data = contract_data[0]
+        
+        # Aquí podrías implementar una tabla de histórico si la necesitas
+        # Por ahora, solo logueamos que se preservaron los datos
+        logger.info(f"Datos de contrato preservados para documento {document_id}")
+        logger.info(f"Contrato: {current_data.get('numero_contrato')}, Tipo: {current_data.get('tipo_contrato')}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error al preservar datos del contrato: {str(e)}")
+        return False
+
+def log_contract_changes(document_id):
+    """
+    Registra y muestra los cambios detectados en los datos del contrato
+    """
+    try:
+        # Esta función es similar a la de identificación pero para contratos
+        logger.info(f"📋 Verificando cambios en contrato {document_id}")
+        # Implementar si necesitas histórico
+        
+    except Exception as e:
+        logger.error(f"Error al registrar cambios: {str(e)}")    
+
+def format_date(date_str):
+    """Convierte una fecha en formato string a formato ISO"""
+    if not date_str:
+        return None
+    
+    # Patrones comunes de fecha
+    patterns = [
+        r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})',  # DD/MM/YYYY o DD-MM-YYYY
+        r'(\d{1,2})[/-](\d{1,2})[/-](\d{2})',   # DD/MM/YY o DD-MM-YY
+        r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})'    # YYYY/MM/DD o YYYY-MM-DD
+    ]
+    
+    for pattern in patterns:
+        match = re.match(pattern, date_str)
+        if match:
+            groups = match.groups()
+            if len(groups[2]) == 4:  # Si el año tiene 4 dígitos
+                if len(groups) == 3:
+                    # Formato DD/MM/YYYY
+                    return f"{groups[2]}-{groups[1].zfill(2)}-{groups[0].zfill(2)}"
+            elif len(groups[2]) == 2:  # Si el año tiene 2 dígitos
+                year = int(groups[2])
+                if year < 50:  # Asumimos que años < 50 son del siglo XXI
+                    year += 2000
+                else:  # Años >= 50 son del siglo XX
+                    year += 1900
+                # Formato DD/MM/YY
+                return f"{year}-{groups[1].zfill(2)}-{groups[0].zfill(2)}"
+            elif len(groups[0]) == 4:  # YYYY/MM/DD
+                return f"{groups[0]}-{groups[1].zfill(2)}-{groups[2].zfill(2)}"
+    
+    # Si no se reconoce el formato, devolver None
+    return None        
