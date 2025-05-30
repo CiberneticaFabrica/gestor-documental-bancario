@@ -1,3 +1,5 @@
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/CiberneticaFabrica/gestor-documental-bancario)
+
 Gestor Documental Bancario - Sistema de Procesamiento Automático
 Sistema serverless para la automatización de la captura, clasificación, procesamiento y gestión de documentos bancarios utilizando inteligencia artificial en AWS.
 Descripción General
