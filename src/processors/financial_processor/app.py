@@ -1,4 +1,4 @@
-# src/processors/financial_processor/app.py
+# src/processors/financial_processor/app.py - VERSIÓN SIMPLIFICADA
 import os
 import json
 import boto3
@@ -22,10 +22,15 @@ from common.db_connector import (
     generate_uuid,
     link_document_to_client,
     assign_folder_and_link,
-    get_client_id_by_document
+    get_client_id_by_document,
+    log_document_processing_start,
+    log_document_processing_end,
+    execute_query
 )
 from financial_parser import parse_financial_document, extract_transactions
- 
+
+from common.flow_utilis import crear_instancia_flujo_documento
+
 
 # Configurar el logger
 logger = logging.getLogger()
@@ -43,51 +48,58 @@ retry_config = Config(
 # Instanciar clientes de AWS (solo para AWS SDK, no Textract/Comprehend)
 sqs_client = boto3.client('sqs', config=retry_config)
 
-def get_extracted_data_from_db(document_id):
+def get_extracted_data_from_db_simplified(document_id):
     """
-    Recupera los datos ya extraídos por textract_callback de la base de datos.
-    Centraliza la extracción para simplificar el manejo de errores.
+    VERSIÓN SIMPLIFICADA: Recupera los datos ya extraídos por textract_callback
+    SIN modificar el análisis existente - SOLO lectura
     """
     try:
         start_time = time.time()
-        # Obtener documento
-        document_data = get_document_by_id(document_id)
+        logger.info(f"📥 Recuperando datos extraídos para documento financiero {document_id}...")
         
+        # Obtener documento básico
+        document_data = get_document_by_id(document_id)
         if not document_data:
-            logger.error(f"No se encontró el documento {document_id} en la base de datos")
+            logger.error(f"❌ No se encontró el documento {document_id}")
             return None
         
         # Obtener los datos extraídos del campo JSON
         extracted_data = {}
         if document_data.get('datos_extraidos_ia'):
             try:
-                # Si ya es un diccionario, usarlo directamente
                 if isinstance(document_data['datos_extraidos_ia'], dict):
                     extracted_data = document_data['datos_extraidos_ia']
                 else:
-                    # Si es una cadena JSON, deserializarla
                     extracted_data = json.loads(document_data['datos_extraidos_ia'])
+                logger.info(f"📄 Datos del documento procesados: {len(extracted_data)} campos")
             except json.JSONDecodeError:
-                logger.error(f"Error al decodificar datos_extraidos_ia para documento {document_id}")
+                logger.error(f"❌ Error decodificando datos_extraidos_ia para documento {document_id}")
                 return None
         
         # Obtener texto extraído y datos analizados
         query = """
-        SELECT texto_extraido, entidades_detectadas, metadatos_extraccion, estado_analisis, tipo_documento
+        SELECT 
+            id_analisis,
+            texto_extraido, 
+            entidades_detectadas, 
+            metadatos_extraccion, 
+            estado_analisis, 
+            tipo_documento,
+            confianza_clasificacion
         FROM analisis_documento_ia
         WHERE id_documento = %s
         ORDER BY fecha_analisis DESC
         LIMIT 1
         """
         
-        from common.db_connector import execute_query
         analysis_results = execute_query(query, (document_id,))
         
         if not analysis_results:
-            logger.warning(f"No se encontró análisis en base de datos para documento {document_id}")
+            logger.warning(f"⚠️ No se encontró análisis en base de datos para documento {document_id}")
             # Continuar con lo que tengamos en datos_extraidos_ia
         else:
             analysis_data = analysis_results[0]
+            logger.info(f"📊 Análisis encontrado: ID {analysis_data.get('id_analisis')}")
             
             # Agregar texto completo
             if analysis_data.get('texto_extraido'):
@@ -99,7 +111,7 @@ def get_extracted_data_from_db(document_id):
                     entidades = json.loads(analysis_data['entidades_detectadas']) if isinstance(analysis_data['entidades_detectadas'], str) else analysis_data['entidades_detectadas']
                     extracted_data['entidades'] = entidades
                 except json.JSONDecodeError:
-                    logger.warning(f"Error al decodificar entidades_detectadas para documento {document_id}")
+                    logger.warning(f"⚠️ Error al decodificar entidades_detectadas para documento {document_id}")
             
             # Agregar metadatos de extracción
             if analysis_data.get('metadatos_extraccion'):
@@ -107,38 +119,43 @@ def get_extracted_data_from_db(document_id):
                     metadatos = json.loads(analysis_data['metadatos_extraccion']) if isinstance(analysis_data['metadatos_extraccion'], str) else analysis_data['metadatos_extraccion']
                     extracted_data['metadatos_extraccion'] = metadatos
                 except json.JSONDecodeError:
-                    logger.warning(f"Error al decodificar metadatos_extraccion para documento {document_id}")
+                    logger.warning(f"⚠️ Error al decodificar metadatos_extraccion para documento {document_id}")
             
             # Agregar tipo de documento detectado
             if analysis_data.get('tipo_documento'):
                 extracted_data['tipo_documento_detectado'] = analysis_data['tipo_documento']
+            
+            # Agregar confianza
+            if analysis_data.get('confianza_clasificacion'):
+                extracted_data['confianza_inicial'] = analysis_data['confianza_clasificacion']
         
         # Registrar tiempo de consulta
-        logger.info(f"Datos recuperados para documento {document_id} en {time.time() - start_time:.2f} segundos")
+        logger.info(f"✅ Datos recuperados para documento {document_id} en {time.time() - start_time:.2f} segundos")
         
         return {
             'document_id': document_id,
+            'analysis_id': analysis_results[0].get('id_analisis') if analysis_results else None,
             'document_data': document_data,
             'extracted_data': extracted_data
         }
         
     except Exception as e:
-        logger.error(f"Error al recuperar datos de documento {document_id}: {str(e)}")
+        logger.error(f"❌ Error al recuperar datos de documento {document_id}: {str(e)}")
         logger.error(traceback.format_exc())
         return None
 
-def process_financial_data(document_id, extracted_data):
+def process_financial_data_simplified(document_id, extracted_data):
     """
-    Procesa los datos financieros ya extraídos y estructura la información.
+    VERSIÓN SIMPLIFICADA: Procesa los datos financieros ya extraídos
     Esta función no llama a servicios externos como Textract o Comprehend.
     """
     try:
         start_time = time.time()
-        logger.info(f"Procesando datos financieros para documento {document_id}")
+        logger.info(f"🔍 Procesando datos financieros para documento {document_id}")
         
         # Verificar si tenemos el texto completo
         if not extracted_data.get('texto_completo'):
-            logger.warning(f"No se encontró texto completo para documento {document_id}")
+            logger.warning(f"⚠️ No se encontró texto completo para documento {document_id}")
             return {
                 'success': False,
                 'error': 'No hay texto completo disponible para procesar'
@@ -151,10 +168,8 @@ def process_financial_data(document_id, extracted_data):
         entities = {}
         if extracted_data.get('entidades'):
             if isinstance(extracted_data['entidades'], dict):
-                # Si ya están organizadas por tipo
                 entities = extracted_data['entidades']
             elif isinstance(extracted_data['entidades'], list):
-                # Si es una lista de entidades, organizarlas por tipo
                 for entity in extracted_data['entidades']:
                     if isinstance(entity, dict) and 'Type' in entity and 'Text' in entity:
                         entity_type = entity['Type']
@@ -175,16 +190,11 @@ def process_financial_data(document_id, extracted_data):
             financial_data['movimientos'] = transactions
         elif 'tables' in extracted_data.get('metadatos_extraccion', {}):
             # Si hay tablas disponibles, intentar extraer transacciones de ellas
-            tables = extracted_data['metadatos_extraccion']['tables']
-            # Esta función necesitaría adaptarse para trabajar con la estructura de tablas
-            # en metadatos_extraccion, pero depende de cómo se hayan almacenado
-            # Simplemente pasamos las transacciones ya extraídas por textract_callback
             if 'transacciones' in extracted_data:
                 financial_data['movimientos'] = extracted_data['transacciones']
         
         # Verificar si ya tenemos información específica extraída
         if extracted_data.get('specific_data'):
-            # Si ya tenemos datos específicos, complementamos
             for key, value in extracted_data['specific_data'].items():
                 if not financial_data.get(key) and value:
                     financial_data[key] = value
@@ -192,9 +202,9 @@ def process_financial_data(document_id, extracted_data):
         # Añadir metadatos de procesamiento
         financial_data['fecha_procesamiento'] = datetime.now().isoformat()
         financial_data['tiempo_procesamiento'] = time.time() - start_time
-        financial_data['fuente'] = 'financial_processor_optimizado'
+        financial_data['fuente'] = 'financial_processor_simplificado'
         
-        logger.info(f"Procesamiento financiero completado en {financial_data['tiempo_procesamiento']:.2f} segundos.")
+        logger.info(f"✅ Procesamiento financiero completado en {financial_data['tiempo_procesamiento']:.2f} segundos.")
         
         return {
             'success': True,
@@ -202,16 +212,16 @@ def process_financial_data(document_id, extracted_data):
         }
         
     except Exception as e:
-        logger.error(f"Error al procesar datos financieros {document_id}: {str(e)}")
+        logger.error(f"❌ Error al procesar datos financieros {document_id}: {str(e)}")
         logger.error(traceback.format_exc())
         return {
             'success': False,
             'error': str(e)
         }
 
-def validate_financial_data(financial_data):
+def validate_financial_data_simplified(financial_data):
     """
-    Valida los datos financieros extraídos para determinar confianza y completitud
+    VERSIÓN SIMPLIFICADA: Valida los datos financieros extraídos
     """
     validation = {
         'is_valid': True,
@@ -223,39 +233,39 @@ def validate_financial_data(financial_data):
     # Verificar información básica
     if not financial_data.get('tipo_documento'):
         validation['warnings'].append("No se pudo determinar el tipo de documento financiero")
+        financial_data['tipo_documento'] = 'extracto_bancario'  # Default
     
-    # Para extractos bancarios, verificar número de cuenta y saldo
+    # Para extractos bancarios, verificar campos importantes
     if financial_data.get('tipo_documento') == 'extracto_bancario':
         if not financial_data.get('numero_cuenta'):
-            validation['warnings'].append("No se ha podido extraer el número de cuenta")
+            validation['warnings'].append("No se pudo extraer el número de cuenta")
         
         if not financial_data.get('saldo'):
-            validation['warnings'].append("No se ha podido extraer el saldo")
+            validation['warnings'].append("No se pudo extraer el saldo")
         
         # Verificar si hay movimientos
         if not financial_data.get('movimientos') or len(financial_data.get('movimientos', [])) == 0:
-            validation['warnings'].append("No se han podido extraer movimientos bancarios")
+            validation['warnings'].append("No se pudieron extraer movimientos bancarios")
     
     # Para facturas, verificar importe total
     elif financial_data.get('tipo_documento') == 'factura':
         if not financial_data.get('importe_total'):
-            validation['warnings'].append("No se ha podido extraer el importe total de la factura")
+            validation['warnings'].append("No se pudo extraer el importe total de la factura")
     
     # Para nóminas, verificar datos críticos
     elif financial_data.get('tipo_documento') == 'nomina':
         if not financial_data.get('salario_neto'):
-            validation['warnings'].append("No se ha podido extraer el salario neto")
+            validation['warnings'].append("No se pudo extraer el salario neto")
     
     # Calcular confianza basada en campos extraídos
-    # La lista de campos cambia según el tipo de documento
     required_fields = ['tipo_documento']
     
     if financial_data.get('tipo_documento') == 'extracto_bancario':
-        required_fields.extend(['numero_cuenta', 'saldo', 'fecha_extracto'])
+        required_fields.extend(['numero_cuenta', 'saldo'])
     elif financial_data.get('tipo_documento') == 'factura':
-        required_fields.extend(['importe_total', 'fecha_factura', 'emisor'])
+        required_fields.extend(['importe_total'])
     elif financial_data.get('tipo_documento') == 'nomina':
-        required_fields.extend(['salario_neto', 'periodo', 'empresa'])
+        required_fields.extend(['salario_neto'])
     
     # Contar campos completos
     complete_fields = sum(1 for field in required_fields if financial_data.get(field))
@@ -263,210 +273,51 @@ def validate_financial_data(financial_data):
     
     # Ajustar confianza por la presencia de movimientos
     if financial_data.get('tipo_documento') == 'extracto_bancario' and financial_data.get('movimientos'):
-        # Si hay más de 5 movimientos, aumenta la confianza
         movement_bonus = min(0.2, len(financial_data.get('movimientos', [])) * 0.02)
         base_confidence += movement_bonus
     
     # Limitar confianza entre 0.3 y 0.95
     validation['confidence'] = min(0.95, max(0.3, base_confidence))
     
-    # Si hay demasiadas advertencias, marcar con confianza baja pero no inválido
-    if len(validation['warnings']) > 3:
-        validation['confidence'] = max(0.3, validation['confidence'] - 0.2)
-    
     return validation
 
-def save_financial_data_to_db(document_id, financial_data, validation):
-    """
-    Guarda los datos financieros en la base de datos,
-    gestionando errores y validando los datos.
-    """
-    try:
-        # Verificar que financial_data sea JSON serializable
-        try:
-            json_data = json.dumps(financial_data)
-        except (TypeError, OverflowError) as json_error:
-            logger.error(f"Error al serializar datos financieros: {str(json_error)}")
-            
-            # Filtrar datos problemáticos
-            cleaned_data = {}
-            for key, value in financial_data.items():
-                try:
-                    json.dumps({key: value})
-                    cleaned_data[key] = value
-                except:
-                    logger.warning(f"Campo no serializable: {key}, convertido a string")
-                    if value is None:
-                        cleaned_data[key] = None
-                    else:
-                        try:
-                            cleaned_data[key] = str(value)
-                        except:
-                            cleaned_data[key] = f"ERROR: No serializable ({type(value).__name__})"
-            
-            # Usar datos limpios
-            json_data = json.dumps(cleaned_data)
-            financial_data = cleaned_data
-        
-        # Extraer valores para actualización
-        confidence = validation.get('confidence', 0.0)
-        is_valid = validation.get('is_valid', False)
-        
-        # Actualizar documento con datos extraídos
-        update_document_extraction_data(
-            document_id,
-            json_data,
-            confidence,
-            is_valid
-        )
-        
-        # Determinar estado de procesamiento
-        status = 'completado' if is_valid else 'revisión_requerida'
-        
-        # Crear mensaje detallado
-        message_parts = []
-        if is_valid:
-            message_parts.append(f"Documento financiero tipo {financial_data.get('tipo_documento', 'desconocido')} procesado correctamente")
-        else:
-            message_parts.append("Documento financiero procesado con advertencias")
-            
-        # Añadir información sobre validación
-        if validation.get('warnings'):
-            message_parts.append(f"{len(validation.get('warnings'))} advertencias encontradas")
-        
-        message = ". ".join(message_parts)
-        
-        # Añadir detalles completos
-        details = {
-            "validación": {
-                "confianza": confidence,
-                "es_válido": is_valid,
-                "advertencias": validation.get('warnings', []),
-                "errores": validation.get('errors', [])
-            },
-            "tipo_operación": "procesamiento_financiero",
-            "campos_extraídos": list(financial_data.keys())
-        }
-        
-        # Actualizar registro de análisis
-        try:
-            update_document_processing_status(
-                document_id, 
-                status, 
-                json.dumps(details)
-            )
-            logger.info(f"Estado actualizado para documento {document_id}: {status}")
-        except Exception as status_error:
-            logger.error(f"Error al actualizar estado del documento: {str(status_error)}")
-            
-            # Intento de recuperación con nuevo registro
-            try:
-                analysis_id = generate_uuid()
-                logger.info(f"Creando nuevo registro de análisis para {document_id}")
-                
-                # Insertar nuevo registro de análisis
-                insert_analysis_record({
-                    'id_analisis': analysis_id,
-                    'id_documento': document_id,
-                    'tipo_documento': financial_data.get('tipo_documento', 'extracto_bancario'),
-                    'confianza_clasificacion': confidence,
-                    'texto_extraido': None,  # No duplicamos el texto
-                    'entidades_detectadas': json.dumps(financial_data.get('entidades_detectadas', {})),
-                    'metadatos_extraccion': json.dumps({
-                        'num_movimientos': len(financial_data.get('movimientos', [])),
-                        'validation': details
-                    }),
-                    'fecha_analisis': datetime.now().isoformat(),
-                    'estado_analisis': status,
-                    'mensaje_error': None,
-                    'version_modelo': 'financial_processor-1.0',
-                    'tiempo_procesamiento': int(financial_data.get('tiempo_procesamiento', 0) * 1000),
-                    'procesado_por': 'financial_processor',
-                    'requiere_verificacion': not is_valid,
-                    'verificado': False,
-                    'verificado_por': None,
-                    'fecha_verificacion': None
-                })
-                logger.info(f"Nuevo registro de análisis creado con éxito para {document_id}")
-            except Exception as recovery_error:
-                logger.error(f"Error de recuperación: {str(recovery_error)}")
-                raise
-        
-        # Intentar vincular con cliente
-        try:
-            # Buscar posibles referencias de cliente en los datos
-            client_info = None
-            
-            # Intentar por número de cuenta
-            if financial_data.get('numero_cuenta'):
-                if link_document_to_client(document_id, client_id=None, reference=financial_data['numero_cuenta']):
-                    logger.info(f"Documento {document_id} vinculado a cliente mediante número de cuenta")
-                    client_info = "Vinculado por número de cuenta"
-            
-            # Si no, intentar por titular
-            if not client_info and financial_data.get('titular'):
-                if link_document_to_client(document_id, client_id=None, name=financial_data['titular']):
-                    logger.info(f"Documento {document_id} vinculado a cliente mediante nombre de titular")
-                    client_info = "Vinculado por titular"
-            
-            # Último intento con document_id
-            if not client_info:
-                if link_document_to_client(document_id):
-                    logger.info(f"Documento {document_id} vinculado a cliente")
-                    client_info = "Vinculado por ID genérico"
-            
-            # Actualizar con información de vinculación
-            if client_info:
-                financial_data['cliente_info'] = client_info
-                # Actualizar de nuevo para guardar esta información
-                update_document_extraction_data(
-                    document_id,
-                    json.dumps(financial_data),
-                    confidence,
-                    is_valid
-                )
-            
-        except Exception as link_error:
-            logger.warning(f"No se pudo vincular el documento a un cliente: {str(link_error)}")
-        
-        return {
-            "success": True,
-            "document_id": document_id,
-            "status": status,
-            "confidence": confidence,
-            "is_valid": is_valid,
-            "analysis_id": analysis_id  # ← IMPORTANTE
-        }
-        
-    except Exception as e:
-        logger.error(f"Error grave al guardar datos financieros: {str(e)}")
-        logger.error(traceback.format_exc())
-        
-        # Intentar actualizar el estado con el error
-        try:
-            error_msg = f"Error al guardar datos: {str(e)}"
-            update_document_processing_status(document_id, 'error_guardado', error_msg)
-        except:
-            logger.error("No se pudo actualizar el estado con el error")
-            
-        return {
-            "success": False,
-            "document_id": document_id,
-            "error": str(e)
-        }
+def evaluate_confidence_simple(confidence_score, validation_results):
+    """Función simple para evaluar si requiere revisión manual"""
+    requires_review = False
+    
+    # Requiere revisión si confianza es baja
+    if confidence_score < 0.7:
+        requires_review = True
+    
+    # Requiere revisión si hay errores críticos
+    if validation_results.get('errors') and len(validation_results['errors']) > 0:
+        requires_review = True
+    
+    # Requiere revisión si hay muchas advertencias
+    if validation_results.get('warnings') and len(validation_results['warnings']) > 2:
+        requires_review = True
+    
+    return requires_review
 
 def lambda_handler(event, context):
     """
-    Función principal que procesa documentos financieros.
-    Optimizada para trabajar con datos ya extraídos por textract_callback.
-    Se activa por mensajes de la cola SQS de documentos financieros.
+    VERSIÓN SIMPLIFICADA: Procesa documentos financieros sin modificar análisis existente
+    - Lee datos del análisis existente
+    - Guarda datos financieros en el documento
+    - SIEMPRE asigna carpeta
+    - NO modifica el análisis original
     """
     start_time = time.time()
+    logger.info("="*80)
+    logger.info("🚀 PROCESADOR FINANCIERO - VERSIÓN SIMPLIFICADA")
+    logger.info("="*80)
     logger.info("Evento recibido: " + json.dumps(event))
     
     response = {
         'procesados': 0,
         'errores': 0,
+        'requieren_revision': 0,
+        'carpetas_asignadas': 0,
         'detalles': []
     }
 
@@ -474,10 +325,16 @@ def lambda_handler(event, context):
         documento_detalle = {
             'documento_id': None,
             'estado': 'sin_procesar',
-            'tiempo': 0
+            'tiempo': 0,
+            'tipo_detectado': None,
+            'datos_guardados': False,
+            'carpeta_asignada': False,
+            'requiere_revision': False
         }
         
         record_start = time.time()
+        registro_id = None
+        document_id = None
         
         try:
             # Parsear el mensaje SQS
@@ -485,105 +342,211 @@ def lambda_handler(event, context):
             document_id = message_body['document_id']
             documento_detalle['documento_id'] = document_id
             
-            logger.info(f"Procesando documento financiero {document_id}")
+            logger.info(f"💰 Procesando documento financiero {document_id}")
             
-      
-            # Paso 1: Obtener datos ya extraídos de la base de datos
-            document_data_result = get_extracted_data_from_db(document_id)
+            # Iniciar registro de procesamiento
+            registro_id = log_document_processing_start(
+                document_id, 
+                'procesamiento_financiero_simplificado',
+                datos_entrada=message_body
+            )
+            
+            # ✅ PASO 1: Obtener datos extraídos de la BD (SIN MODIFICAR ANÁLISIS)
+            logger.info(f"📥 Recuperando datos extraídos de la base de datos...")
+            document_data_result = get_extracted_data_from_db_simplified(document_id)
             
             if not document_data_result:
-                logger.error(f"No se pudieron recuperar datos del documento {document_id}")
-                documento_detalle['estado'] = 'error_recuperacion_datos'
-                response['errores'] += 1
-                continue
+                raise Exception(f"No se pudieron recuperar datos del documento {document_id}")
             
-            # Paso 0: Obtener tipo_documento antes de asignar carpeta
-            tipo_detectado = document_data_result['extracted_data'].get('tipo_documento_detectado', 'financiero')
-
-            # Asignar carpeta y marcar documento solicitado como recibido
-            cliente_id = get_client_id_by_document(document_id)
-            assign_folder_and_link(cliente_id,document_id)
-            logger.info(f"Procesando documento financiero Asignar carpeta y marcar documento solicitado como recibido {document_id}")
- 
-            # Paso 2: Procesar los datos financieros
-            process_result = process_financial_data(
+            # Obtener tipo detectado si existe
+            tipo_detectado = document_data_result['extracted_data'].get('tipo_documento_detectado', 'extracto_bancario')
+            documento_detalle['tipo_detectado'] = tipo_detectado
+            
+            # ✅ PASO 2: Procesar los datos financieros
+            logger.info(f"🔍 Procesando datos financieros...")
+            process_result = process_financial_data_simplified(
                 document_id, 
                 document_data_result['extracted_data']
             )
             
             if not process_result['success']:
-                logger.error(f"Error al procesar datos financieros: {process_result.get('error')}")
-                documento_detalle['estado'] = 'error_procesamiento'
-                documento_detalle['error'] = process_result.get('error')
-                response['errores'] += 1
-                continue
+                raise Exception(f"Error al procesar datos financieros: {process_result.get('error')}")
             
-            # Paso 3: Validar los datos financieros
             financial_data = process_result['financial_data']
-            validation = validate_financial_data(financial_data)
             
-            # Paso 4: Guardar datos procesados en la base de datos
-            save_result = save_financial_data_to_db(
-                document_id,
-                financial_data,
+            # ✅ PASO 3: Validar los datos financieros
+            validation = validate_financial_data_simplified(financial_data)
+            
+            logger.info(f"📊 Validación completada - Confianza: {validation['confidence']:.2f}")
+            
+            # ✅ PASO 4: Evaluar si requiere revisión manual
+            requires_review = evaluate_confidence_simple(
+                validation['confidence'],
                 validation
             )
             
-            if save_result['success']:
-                logger.info(f"Datos financieros guardados correctamente para {document_id}")
-                documento_detalle['estado'] = 'procesado_completo'
-                documento_detalle['confianza'] = validation.get('confidence', 0.0)
-                response['procesados'] += 1
-
-                # Evaluar si requiere revisión manual
-                requires_review = evaluate_confidence(
-                    validation['confidence'],
-                    document_type=financial_data.get('tipo_documento', 'extracto_bancario'),
-                    validation_results=validation
-                )
-
-                if requires_review:
-                    logger.warning(f"Documento {document_id} marcado para revisión manual.")
-                    mark_for_manual_review(
-                        document_id=document_id,
-                        analysis_id=save_result.get('analysis_id'),
-                        confidence=validation['confidence'],
-                        document_type=financial_data.get('tipo_documento', 'extracto_bancario'),
-                        validation_info=validation,
-                        extracted_data=financial_data
-                    )
-            else:
-                logger.error(f"Error al guardar datos financieros: {save_result.get('error')}")
-                documento_detalle['estado'] = 'error_guardado'
-                documento_detalle['error'] = save_result.get('error')
-                response['errores'] += 1
+            documento_detalle['requiere_revision'] = requires_review
+            
+            if requires_review:
+                response['requieren_revision'] += 1
+                logger.warning(f"⚠️ Documento {document_id} requiere revisión manual")
+            
+            # ✅ PASO 5: Guardar datos financieros en el documento
+            logger.info(f"💾 Guardando datos financieros procesados...")
+            
+            try:
+                # Verificar que financial_data sea JSON serializable
+                json_data = json.dumps(financial_data, ensure_ascii=False)
                 
-        except json.JSONDecodeError as json_error:
-            logger.error(f"Error al decodificar mensaje SQS: {str(json_error)}")
-            documento_detalle['estado'] = 'error_formato_json'
-            documento_detalle['error'] = str(json_error)
-            response['errores'] += 1
-        except KeyError as key_error:
-            logger.error(f"Falta campo requerido en mensaje: {str(key_error)}")
-            documento_detalle['estado'] = 'error_campo_faltante'
-            documento_detalle['error'] = str(key_error) 
-            response['errores'] += 1
+                # Actualizar documento con datos extraídos
+                update_document_extraction_data(
+                    document_id,
+                    json_data,
+                    validation['confidence'],
+                    validation['is_valid']
+                )
+                
+                logger.info(f"✅ Datos financieros guardados correctamente")
+                documento_detalle['datos_guardados'] = True
+                response['procesados'] += 1
+                
+            except Exception as save_error:
+                logger.error(f"❌ Error al guardar datos financieros: {str(save_error)}")
+                documento_detalle['estado'] = 'error_guardado'
+                response['errores'] += 1
+            
+            # ✅ PASO 6: SIEMPRE ASIGNAR CARPETA (CRÍTICO SEGÚN REQUISITOS)
+            logger.info(f"📁 Asignando carpeta para documento {document_id}...")
+            
+            try:
+                # Buscar cliente del documento
+                cliente_id = get_client_id_by_document(document_id)
+                
+                if cliente_id:
+                    logger.info(f"👤 Cliente encontrado: {cliente_id}")
+                    folder_result = assign_folder_and_link(cliente_id, document_id)
+                    
+                    if folder_result:
+                        logger.info(f"✅ Carpeta asignada correctamente para documento {document_id}")
+                        documento_detalle['carpeta_asignada'] = True
+                        response['carpetas_asignadas'] += 1
+                    else:
+                        logger.warning(f"⚠️ No se pudo asignar carpeta para documento {document_id}")
+                else:
+                    logger.warning(f"⚠️ No se encontró cliente para documento {document_id}")
+                    # Intentar vincular por datos financieros          
+            except Exception as folder_error:
+                logger.error(f"❌ Error asignando carpeta: {str(folder_error)}")
+                # No fallar por error de carpeta, solo advertir
+            
+            # ✅ PASO 7: Actualizar estado del documento
+            if requires_review:
+                status = 'requiere_revision_manual'
+                message = "Documento financiero procesado - Requiere revisión manual"
+            elif validation['is_valid'] and documento_detalle['datos_guardados']:
+                status = 'procesamiento_completado'
+                message = "Documento financiero procesado y guardado correctamente"
+            elif documento_detalle['datos_guardados']:
+                status = 'requiere_revision_manual'
+                message = "Documento financiero procesado con advertencias"
+            else:
+                status = 'requiere_revision_manual'
+                message = "Documento financiero procesado pero no guardado"
+            
+            final_details = {
+                'validación': validation,
+                'tipo_documento': financial_data.get('tipo_documento'),
+                'numero_cuenta': financial_data.get('numero_cuenta'),
+                'saldo': financial_data.get('saldo'),
+                'movimientos_count': len(financial_data.get('movimientos', [])),
+                'campos_extraídos': [k for k, v in financial_data.items() if v is not None],
+                'requires_review': requires_review,
+                'datos_guardados': documento_detalle['datos_guardados'],
+                'carpeta_asignada': documento_detalle['carpeta_asignada'],
+                'procesador': 'financial_processor_simplificado'
+            }
+            
+            update_document_processing_status(
+                document_id, 
+                status, 
+                json.dumps(final_details, ensure_ascii=False)
+            )
+            
+            documento_detalle['confianza'] = validation['confidence']
+            documento_detalle['estado_final'] = status
+            documento_detalle['estado'] = 'procesado'
+            
+            # Finalizar registro principal
+            log_document_processing_end(
+                registro_id, 
+                estado='completado',
+                confianza=validation['confidence'],
+                datos_salida=final_details,
+                mensaje_error=None if validation['is_valid'] else "Procesado con advertencias"
+            )
+            
+            # ==================== PUBLICAR EVENTO ====================
+            crear_instancia_flujo_documento(document_id)
+
+            logger.info(f"✅ Documento {document_id} procesado completamente")
+            logger.info(f"   💰 Tipo documento: {financial_data.get('tipo_documento')}")
+            logger.info(f"   📊 Confianza: {validation['confidence']:.2f}")
+            logger.info(f"   📝 Estado: {status}")
+            logger.info(f"   📁 Carpeta asignada: {'Sí' if documento_detalle['carpeta_asignada'] else 'No'}")
+            logger.info(f"   💾 Datos guardados: {'Sí' if documento_detalle['datos_guardados'] else 'No'}")
+            logger.info(f"   🏦 Cuenta: {financial_data.get('numero_cuenta', 'No detectada')}")
+            logger.info(f"   💵 Saldo: {financial_data.get('saldo', 'No detectado')}")
+            logger.info(f"   📄 Movimientos: {len(financial_data.get('movimientos', []))}")
+                
         except Exception as e:
-            logger.error(f"Error general al procesar mensaje: {str(e)}")
+            error_msg = str(e)
+            logger.error(f"❌ Error procesando documento financiero {document_id if document_id else 'DESCONOCIDO'}: {error_msg}")
             logger.error(traceback.format_exc())
-            documento_detalle['estado'] = 'error_general'
-            documento_detalle['error'] = str(e)
+            
+            documento_detalle['estado'] = 'error'
+            documento_detalle['error'] = error_msg
             response['errores'] += 1
+            
+            # Actualizar estado de error
+            if document_id:
+                try:
+                    update_document_processing_status(
+                        document_id, 
+                        'error_procesamiento_financiero',
+                        f"Error en procesamiento financiero: {error_msg}"
+                    )
+                except:
+                    pass
+            
+            # Finalizar registro con error
+            if registro_id:
+                log_document_processing_end(
+                    registro_id, 
+                    estado='error',
+                    mensaje_error=error_msg
+                )
+                
         finally:
-            documento_detalle['tiempo'] = time.time() - record_start
+            # Calcular tiempo de procesamiento
+            tiempo_procesamiento = time.time() - record_start
+            documento_detalle['tiempo'] = tiempo_procesamiento
             response['detalles'].append(documento_detalle)
 
-    response['tiempo_total'] = time.time() - start_time
+    # Resumen final
+    total_time = time.time() - start_time
+    response['tiempo_total'] = total_time
     response['total_registros'] = len(event['Records'])
     
-    logger.info(f"Procesamiento completado: {response['procesados']} exitosos, {response['errores']} errores en {response['tiempo_total']:.2f} segundos")
-
+    logger.info("="*80)
+    logger.info("📊 RESUMEN DEL PROCESAMIENTO FINANCIERO")
+    logger.info("="*80)
+    logger.info(f"✅ Documentos procesados exitosamente: {response['procesados']}")
+    logger.info(f"⚠️ Documentos que requieren revisión: {response['requieren_revision']}")
+    logger.info(f"❌ Documentos con errores: {response['errores']}")
+    logger.info(f"📁 Carpetas asignadas: {response['carpetas_asignadas']}")
+    logger.info(f"⏱️ Tiempo total: {total_time:.2f} segundos")
+    
     return {
         'statusCode': 200,
-        'body': json.dumps(response)
+        'body': json.dumps(response, ensure_ascii=False)
     }

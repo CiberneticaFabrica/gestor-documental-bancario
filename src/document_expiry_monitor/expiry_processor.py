@@ -97,8 +97,10 @@ def prioritize_documents(documents):
     # Prioridades por tipo de documento (valores más bajos = mayor prioridad)
     document_type_priorities = {
         # ID de tipos de documentos de identidad
-        '11111111-1111-1111-1111-111111111111': 1,  # DNI/Pasaporte
-        '22222222-2222-2222-2222-222222222222': 2,  # Documentos tributarios
+        '6b2b0c6b-26f4-11f0-8066-0affc7b8197b': 1,  # DNI/Pasaporte
+        '6b2b1196-26f4-11f0-8066-0affc7b8197b': 2,  # Documentos tributarios
+        '6b2b13cb-26f4-11f0-8066-0affc7b8197b': 3,  # Documentos de identificación
+        '6b2b163f-26f4-11f0-8066-0affc7b8197b': 4,  # Documentos de identificación
         # Añadir más tipos según necesidad
     }
     

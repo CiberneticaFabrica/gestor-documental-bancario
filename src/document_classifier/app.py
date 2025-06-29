@@ -60,7 +60,8 @@ def determine_processor_queue(document_type):
         'factura': FINANCIAL_PROCESSOR_QUEUE_URL,
         'recibo': FINANCIAL_PROCESSOR_QUEUE_URL,
         'formulario_kyc': CONTRACT_PROCESSOR_QUEUE_URL,
-        'impuesto': FINANCIAL_PROCESSOR_QUEUE_URL
+        'impuesto': FINANCIAL_PROCESSOR_QUEUE_URL,
+        'Comprobante_domicilio': FINANCIAL_PROCESSOR_QUEUE_URL,
     }
     
     # Buscar coincidencias parciales también

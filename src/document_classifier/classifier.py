@@ -79,15 +79,16 @@ DOCUMENT_PATTERNS = {
 # Mapa de tipos de documentos a IDs en base de datos
 # Esto debería obtenerse de la base de datos en implementación real
 DOCUMENT_TYPE_IDS = {
-    'dni': 'a1b2c3d4-1234-5678-9abc-def123456789',  # ID para documentos de identidad DNI
-    'pasaporte': 'b2c3d4e5-2345-6789-abcd-ef1234567890',  # ID para pasaportes
-    'nomina': 'c3d4e5f6-3456-7890-abcd-ef12345678901',  # ID para nóminas
+    'dni': '6b2b0c6b-26f4-11f0-8066-0affc7b8197b',  # ID para documentos de identidad DNI
+    'pasaporte': '6b2b1196-26f4-11f0-8066-0affc7b8197b',  # ID para pasaportes
+    'nomina': '6b2b1516-26f4-11f0-8066-0affc7b8197b',  # ID para nóminas
     'extracto_bancario': 'd4e5f6g7-4567-8901-abcd-ef123456789012',  # ID para extractos
     'contrato': 'e5f6g7h8-5678-9012-abcd-ef1234567890123',  # ID para contratos
     'factura': 'f6g7h8i9-6789-0123-abcd-ef12345678901234',  # ID para facturas
     'recibo': 'g7h8i9j0-7890-1234-abcd-ef12345678901234',  # ID para recibos
-    'formulario_kyc': 'h8i9j0k1-8901-2345-abcd-ef1234567890123456',  # ID para formularios KYC
-    'desconocido': 'd5f2cac1-3308-4a1d-9a65-e7b1a3fa3a8d'  # ID genérico para documentos no clasificados
+    'formulario_kyc': '6b2b163f-26f4-11f0-8066-0affc7b8197b',  # ID para formularios KYC
+    'desconocido': 'd5f2cac1-3308-4a1d-9a65-e7b1a3fa3a8d',  # ID genérico para documentos no clasificados
+    'Comprobante_domicilio': '6b2b1888-26f4-11f0-8066-0affc7b8197b'  # ID Comprobante de domicilio
 }
 
 # Patrones específicos para cédulas panameñas y documentos de identidad

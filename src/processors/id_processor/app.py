@@ -23,9 +23,11 @@ from common.db_connector import (
     preserve_identification_data,
     update_document_extraction_data_with_type_preservation,
     assign_folder_and_link,
-    get_client_id_by_document
+    get_client_id_by_document,
+    generate_uuid
 )
 
+from common.flow_utilis import crear_instancia_flujo_documento
  
 # Configurar el logger
 logger = logging.getLogger()
@@ -2571,9 +2573,9 @@ def lambda_handler(event, context):
     Función principal CORREGIDA para procesar documentos de identidad CON RECONCILIACIÓN
     """
     start_time = time.time()
-    logger.info("="*80)
+    logger.info("=" * 80)
     logger.info("🚀 INICIANDO PROCESAMIENTO DE DOCUMENTO DE IDENTIDAD CON RECONCILIACIÓN")
-    logger.info("="*80)
+    logger.info("=" * 80)
     logger.info("Evento recibido: " + json.dumps(event))
     
     response = {
@@ -2746,13 +2748,11 @@ def lambda_handler(event, context):
                 if success:
                     logger.info(f"✅ Datos guardados exitosamente")
                     documento_detalle['datos_extraidos'] = True
-                    
                     log_document_processing_end(db_registro_id, estado='completado')
                     log_identification_changes(document_id)
                 else:
                     logger.error(f"❌ Error al guardar datos")
                     documento_detalle['error_guardado'] = "Falló el guardado en BD"
-                    
                     log_document_processing_end(
                         db_registro_id, 
                         estado='error',
@@ -2766,7 +2766,9 @@ def lambda_handler(event, context):
                 update_document_processing_status(
                     document_id, 
                     'requiere_revision_manual',
-                    f"Datos extraídos insuficientes tras reconciliación. Número: {id_data.get('numero_identificacion')}, Nombre: {id_data.get('nombre_completo')}"
+                    f"Datos extraídos insuficientes tras reconciliación. "
+                    f"Número: {id_data.get('numero_identificacion')}, "
+                    f"Nombre: {id_data.get('nombre_completo')}"
                 )
             
             # ==================== ACTUALIZAR DOCUMENTO PRINCIPAL ====================
@@ -2812,10 +2814,10 @@ def lambda_handler(event, context):
                 status = 'requiere_revision_manual'
                 message = "Documento procesado con reconciliación - Requiere revisión manual"
             elif validation['is_valid']:
-                status = 'completado'
+                status = 'procesamiento_completado'
                 message = "Documento de identidad procesado correctamente con reconciliación"
             else:
-                status = 'completado_con_advertencias'
+                status = 'requiere_revision_manual'
                 message = "Documento procesado con reconciliación y advertencias"
             
             # Obtener tipo de documento para la actualización de estado
@@ -2854,16 +2856,18 @@ def lambda_handler(event, context):
                 datos_salida=final_details,
                 mensaje_error=None if validation['is_valid'] else "Procesado con advertencias"
             )
-            
+
             logger.info(f"✅ Documento {document_id} procesado completamente")
             logger.info(f"   📋 Tipo: {tipo_detectado}")
             logger.info(f"   📊 Confianza: {confidence:.2f}")
             logger.info(f"   📝 Estado: {status}")
-            logger.info(f"   🔄 Reconciliación: {'✅ Aplicada' if documento_detalle['reconciliacion_aplicada'] else '❌ No disponible'}")
+            reconciliacion_msg = "✅ Aplicada" if documento_detalle['reconciliacion_aplicada'] else "❌ No disponible"
+            logger.info(f"   🔄 Reconciliación: {reconciliacion_msg}")
             
         except Exception as e:
             error_msg = str(e)
-            logger.error(f"❌ Error procesando documento {document_id if 'document_id' in locals() else 'DESCONOCIDO'}: {error_msg}")
+            doc_id = document_id if 'document_id' in locals() else 'DESCONOCIDO'
+            logger.error(f"❌ Error procesando documento {doc_id}: {error_msg}")
             logger.error(traceback.format_exc())
             
             documento_detalle['estado'] = 'error'
@@ -2896,7 +2900,9 @@ def lambda_handler(event, context):
             response['detalles'].append(documento_detalle)
 
     # ==================== ASIGNAR CARPETA (SOLO SI HAY ÉXITOS) ====================
-    
+
+    logger.info(f"📝 Estado base de datos 1: {response['procesados']}")
+
     if response['procesados'] > 0 or response['requieren_revision'] > 0:
         # Buscar CUALQUIER documento que haya sido procesado (exitoso o con revisión)
         last_processed_doc = None
@@ -2908,35 +2914,44 @@ def lambda_handler(event, context):
         if last_processed_doc:
             cliente_id = get_client_id_by_document(last_processed_doc)
             if cliente_id:
-                logger.info(f"👤 Asignando carpeta para documento {last_processed_doc}")
+                logger.info(f"👤 Asignando carpeta para documento {document_id}")
                 assign_folder_and_link(cliente_id, last_processed_doc)
     
-    # ==================== RESUMEN FINAL ====================
-    
-    total_time = time.time() - start_time
-    response['tiempo_total'] = total_time
-    response['total_registros'] = len(event['Records'])
-    
-    logger.info("="*80)
-    logger.info("📊 RESUMEN DEL PROCESAMIENTO CON RECONCILIACIÓN")
-    logger.info("="*80)
-    logger.info(f"✅ Documentos procesados exitosamente: {response['procesados']}")
-    logger.info(f"⚠️ Documentos que requieren revisión: {response['requieren_revision']}")
-    logger.info(f"❌ Documentos con errores: {response['errores']}")
-    logger.info(f"⏱️ Tiempo total: {total_time:.2f} segundos")
-    
-    # Mostrar estadísticas de reconciliación
-    documentos_con_reconciliacion = sum(1 for d in response['detalles'] if d.get('reconciliacion_aplicada', False))
-    logger.info(f"🔄 Documentos con reconciliación aplicada: {documentos_con_reconciliacion}")
-    
-    if response['procesados'] > 0 or response['requieren_revision'] > 0:
-        logger.info("🎉 Procesamiento con reconciliación completado con resultados")
-    else:
-        logger.warning("⚠️ Procesamiento completado SIN documentos exitosos")
-    
+            logger.info(f"📝 Estado antes de crear instancia: {status}")
+
+            # ==================== PUBLICAR EVENTO ====================
+            crear_instancia_flujo_documento(last_processed_doc)
+            
+            # ==================== RESUMEN FINAL ====================
+            logger.info(f"📝 Estado despues de crear instancia: {status}")
+
+            total_time = time.time() - start_time
+            response['tiempo_total'] = total_time
+            response['total_registros'] = len(event['Records'])
+            
+            logger.info("=" * 80)
+            logger.info("📊 RESUMEN DEL PROCESAMIENTO CON RECONCILIACIÓN")
+            logger.info("=" * 80)
+            logger.info(f"✅ Documentos procesados exitosamente: {response['procesados']}")
+            logger.info(f"⚠️ Documentos que requieren revisión: {response['requieren_revision']}")
+            logger.info(f"❌ Documentos con errores: {response['errores']}")
+            logger.info(f"⏱️ Tiempo total: {total_time:.2f} segundos")
+            logger.info(f"📝 Estado: {status}")
+            
+            # Mostrar estadísticas de reconciliación
+            documentos_con_reconciliacion = sum(
+                1 for d in response['detalles'] if d.get('reconciliacion_aplicada', False)
+            )
+            logger.info(f"🔄 Documentos con reconciliación aplicada: {documentos_con_reconciliacion}")
+            
+            if response['procesados'] > 0 or response['requieren_revision'] > 0:
+                logger.info("🎉 Procesamiento con reconciliación completado con resultados")
+            else:
+                logger.warning("⚠️ Procesamiento completado SIN documentos exitosos")
+            
+
     return {
         'statusCode': 200,
         'body': json.dumps(response, ensure_ascii=False)
     }
-
  
