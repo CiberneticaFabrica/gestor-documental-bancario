@@ -50,7 +50,9 @@ try:
         generate_uuid,
         insert_analysis_record,
         log_document_processing_start,
-        log_document_processing_end 
+        log_document_processing_end,
+        get_or_create_analysis_for_version,
+        update_analysis_record_verified
     )
     from common.validation import guess_document_type
     logger.info("Módulos importados correctamente")
@@ -956,25 +958,89 @@ def create_analysis_record_for_version(document_id, version_id, analysis_id):
         logger.error(f"Error creando registro de análisis: {str(e)}")
         return False
 
+def save_query_answers_to_analysis(analysis_id, query_answers):
+    """
+    Guarda las respuestas de queries en el análisis de forma estructurada
+    """
+    try:
+        if not query_answers:
+            logger.warning("No hay query answers para guardar")
+            return True
+        
+        # Estructurar las respuestas para la base de datos
+        structured_answers = {}
+        raw_answers = {}
+        
+        for alias, answer_data in query_answers.items():
+            if answer_data and answer_data.get('answer'):
+                # Respuesta limpia
+                clean_answer = answer_data['answer'].strip()
+                if clean_answer.lower() not in ['not found', 'no encontrado', 'n/a', 'none', '']:
+                    structured_answers[alias] = {
+                        'answer': clean_answer,
+                        'confidence': answer_data.get('confidence', 0),
+                        'question': answer_data.get('question', '')
+                    }
+                    raw_answers[alias] = clean_answer
+        
+        # Actualizar el análisis con las respuestas
+        if structured_answers:
+            update_query = """
+            UPDATE analisis_documento_ia
+            SET entidades_detectadas = %s,
+                metadatos_extraccion = JSON_MERGE_PATCH(
+                    COALESCE(metadatos_extraccion, '{}'),
+                    %s
+                )
+            WHERE id_analisis = %s
+            """
+            
+            entidades_json = json.dumps(structured_answers)
+            metadatos_update = json.dumps({
+                'query_answers': structured_answers,
+                'raw_query_answers': raw_answers,
+                'query_processing': {
+                    'total_queries': len(query_answers),
+                    'answered_queries': len(structured_answers),
+                    'success_rate': len(structured_answers) / len(query_answers) if query_answers else 0
+                }
+            })
+            
+            execute_query(update_query, (entidades_json, metadatos_update, analysis_id), fetch=False)
+            logger.info(f"✅ Query answers guardadas: {len(structured_answers)} respuestas válidas")
+            
+            # Log detallado de las respuestas guardadas
+            for alias, data in structured_answers.items():
+                logger.info(f"   📝 {alias}: {data['answer']} (confianza: {data['confidence']})")
+            
+            return True
+        else:
+            logger.warning("⚠️ No se encontraron respuestas válidas para guardar")
+            return False
+            
+    except Exception as e:
+        logger.error(f"❌ Error guardando query answers: {str(e)}")
+        return False
+ 
 
 def lambda_handler(event, context):
     """
-    FUNCIÓN PRINCIPAL CORREGIDA: Maneja callbacks de Textract de manera robusta
+    VERSIÓN ULTRA-CORREGIDA: Maneja callbacks de Textract con IDs verificados
     """
     callback_registro_id = log_document_processing_start(
-        'textract_callback_robusto',
-        'procesar_callback_textract_v2',
+        'textract_callback_ultra_robusto',
+        'procesar_callback_textract_v3',
         datos_entrada={"sns_records": len(event.get('Records', []))}
     )
     
     try:
-        logger.info(f"📨 Callback de Textract recibido")
+        logger.info(f"📨 Callback de Textract recibido (versión ultra-robusta)")
         
-        # Validar estructura del evento
+        # 1. ✅ VALIDAR ESTRUCTURA DEL EVENTO
         if not event.get('Records') or len(event['Records']) == 0:
             raise ValueError("Evento SNS inválido o vacío")
         
-        # Extraer mensaje SNS
+        # 2. ✅ EXTRAER INFORMACIÓN DEL JOB
         sns_record = event['Records'][0]
         if 'Sns' not in sns_record or 'Message' not in sns_record['Sns']:
             raise ValueError("Estructura de mensaje SNS inválida")
@@ -982,7 +1048,6 @@ def lambda_handler(event, context):
         sns_message = sns_record['Sns']['Message']
         message_json = json.loads(sns_message)
         
-        # Extraer información del job
         job_id = message_json.get('JobId')
         status = message_json.get('Status')
         job_tag = message_json.get('JobTag', '')
@@ -992,249 +1057,306 @@ def lambda_handler(event, context):
         
         logger.info(f"📋 Job procesado: JobId={job_id}, Status={status}, JobTag={job_tag}")
         
-        # Extraer document_id del job_tag
+        # 3. ✅ EXTRAER DOCUMENT_ID DEL JOB_TAG
         document_id = get_document_id_from_job_tag(job_tag)
         if not document_id:
             raise ValueError(f"No se pudo extraer document_id del JobTag: {job_tag}")
         
-        # Registrar procesamiento del documento específico
+        # 4. ✅ PROCESAR SOLO SI EL JOB FUE EXITOSO
+        if status != 'SUCCEEDED':
+            logger.error(f"❌ Textract falló para JobId: {job_id}")
+            update_document_processing_status(
+                document_id,
+                'textract_fallido',
+                f"Textract falló para JobId: {job_id}"
+            )
+            
+            log_document_processing_end(
+                callback_registro_id,
+                estado='error',
+                mensaje_error=f"Textract failed with status: {status}"
+            )
+            
+            return create_error_response(f"Textract failed: {status}")
+        
+        # 5. ✅ REGISTRAR PROCESAMIENTO DEL DOCUMENTO ESPECÍFICO
         doc_registro_id = log_document_processing_start(
             document_id,
-            'callback_documento_especifico',
+            'callback_documento_ultra_robusto',
             datos_entrada={"job_id": job_id, "status": status},
             analisis_id=callback_registro_id
         )
         
-        if status == 'SUCCEEDED':
-            logger.info(f"✅ Procesamiento exitoso para documento {document_id}")
+        logger.info(f"✅ Procesamiento exitoso para documento {document_id}")
+        
+        # 6. ✅ OBTENER INFORMACIÓN CONSISTENTE DE VERSIÓN Y ANÁLISIS
+        version_analysis_registro_id = log_document_processing_start(
+            document_id,
+            'obtener_version_analisis_verificado',
+            datos_entrada={"job_id": job_id},
+            analisis_id=doc_registro_id
+        )
+        
+        # Obtener información del documento
+        doc_info = get_document_by_id(document_id)
+        if not doc_info:
+            raise ValueError(f"Documento {document_id} no encontrado en base de datos")
+        
+        version_actual = doc_info.get('version_actual', 1)
+        version_id = get_version_id(document_id, version_actual)
+        
+        if not version_id:
+            error_msg = f"CRÍTICO: No se pudo obtener version_id para documento {document_id}, versión {version_actual}"
+            logger.error(f"❌ {error_msg}")
             
-            # Validar consistencia del documento
-            consistency_valid, consistency_msg = validate_document_version_consistency(document_id)
-            if not consistency_valid:
-                logger.warning(f"⚠️ Inconsistencia detectada: {consistency_msg}")
+            log_document_processing_end(version_analysis_registro_id, estado='error', mensaje_error=error_msg)
+            log_document_processing_end(doc_registro_id, estado='error', mensaje_error=error_msg)
+            log_document_processing_end(callback_registro_id, estado='error', mensaje_error=error_msg)
             
-            # Obtener información del documento
-            doc_info = get_document_by_id(document_id)
-            if not doc_info:
-                raise ValueError(f"Documento {document_id} no encontrado en base de datos")
+            return create_error_response("Version ID no encontrado")
+        
+        # Obtener o crear análisis vinculado a la versión
+        analysis_id = get_or_create_analysis_for_version(document_id, version_id)
+        
+        if not analysis_id:
+            error_msg = f"CRÍTICO: No se pudo obtener/crear analysis_id para documento {document_id}, versión {version_id}"
+            logger.error(f"❌ {error_msg}")
             
-            version_actual = doc_info.get('version_actual', 1)
-            version_id = get_version_id(document_id, version_actual)
+            log_document_processing_end(version_analysis_registro_id, estado='error', mensaje_error=error_msg)
+            log_document_processing_end(doc_registro_id, estado='error', mensaje_error=error_msg)
+            log_document_processing_end(callback_registro_id, estado='error', mensaje_error=error_msg)
             
-            if not version_id:
-                logger.warning(f"⚠️ Version ID no encontrado, generando temporal")
-                version_id = generate_uuid()
-            
-            logger.info(f"📄 Documento: {document_id}, Versión: {version_actual}, Version ID: {version_id}")
-            
-            # Obtener resultados de Textract
-            textract_get_id = log_document_processing_start(
-                document_id,
-                'obtener_resultados_textract_v2',
-                datos_entrada={"job_id": job_id},
-                analisis_id=doc_registro_id
-            )
-            
-            job_type = 'DOCUMENT_TEXT_DETECTION' if '_detection' in job_tag else 'DOCUMENT_ANALYSIS'
-            textract_results, get_time = get_textract_results_safe(job_id, job_type)
-            
-            if not textract_results:
-                raise ValueError(f"No se pudieron obtener resultados para JobId: {job_id}")
-            
-            log_document_processing_end(
-                textract_get_id,
-                estado='completado',
-                datos_procesados={"pages_obtained": len(textract_results)},
-                duracion_ms=int(get_time * 1000)
-            )
-            
-            # Extracción completa de datos
-            extraction_id = log_document_processing_start(
-                document_id,
-                'extraccion_completa_v2',
-                datos_entrada={"pages_count": len(textract_results)},
-                analisis_id=doc_registro_id
-            )
-            
-            logger.info(f"🔄 Iniciando extracción completa de datos...")
-            all_extracted_data = extract_complete_data_from_textract_fixed(textract_results)
-            
-            if not all_extracted_data['extraction_success']:
-                logger.warning(f"⚠️ Extracción parcialmente exitosa")
-            
-            log_document_processing_end(
-                extraction_id,
-                estado='completado',
-                datos_procesados={
-                    "extraction_success": all_extracted_data['extraction_success'],
-                    "text_length": len(all_extracted_data.get('full_text', '')),
-                    "confidence": all_extracted_data.get('extraction_confidence', 0)
-                },
-                duracion_ms=int(all_extracted_data.get('processing_time', 0) * 1000)
-            )
-            
-            # Obtener o crear analysis_id
-            analysis_id = get_analysis_id_for_document(document_id, version_id)
-            if not analysis_id:
-                analysis_id = generate_uuid()
-                create_analysis_record_for_version(document_id, version_id, analysis_id)
-                logger.info(f"➕ Nuevo analysis_id creado: {analysis_id}")
-            
-            # Actualizar base de datos
-            db_update_id = log_document_processing_start(
-                document_id,
-                'actualizar_bd_v2',
-                datos_entrada={"analysis_id": analysis_id},
-                analisis_id=doc_registro_id
-            )
-            
-            try:
-                # Actualizar análisis
-                confidence = all_extracted_data.get('extraction_confidence', 0.5)
-                doc_type = all_extracted_data.get('doc_type_info', {}).get('document_type', 'documento')
-                
-                update_success = update_analysis_record(
-                    analysis_id,
-                    all_extracted_data.get('full_text', ''),
-                    json.dumps(all_extracted_data.get('structured_data', {})),
-                    json.dumps({
-                        'job_id': job_id,
-                        'extraction_metadata': all_extracted_data.get('metadata', {}),
-                        'query_answers': all_extracted_data.get('query_answers', {}),
-                        'extraction_confidence': confidence,
-                        'version_info': {'version_actual': version_actual, 'version_id': version_id}
-                    }),
-                    'textract_completado_v2',
-                    f"textract-{job_type}",
-                    int(get_time * 1000),
-                    'textract_callback_v2',
-                    confidence < 0.85,
-                    False,
-                    mensaje_error=all_extracted_data.get('error_message'),
-                    confianza_clasificacion=confidence,
-                    tipo_documento=doc_type,
-                    id_version=version_id
-                )
-                
-                if not update_success:
-                    logger.warning("⚠️ Update analysis falló, pero continuando...")
-                
-                # Actualizar documento
-                extraction_summary = {
-                    'document_type': doc_type,
-                    'confidence': confidence,
-                    'extraction_success': all_extracted_data['extraction_success'],
-                    'tables_count': len(all_extracted_data.get('tables', [])),
-                    'forms_count': len(all_extracted_data.get('forms', {})),
-                    'queries_count': len(all_extracted_data.get('query_answers', {})),
-                    'version_info': {'version_actual': version_actual, 'version_id': version_id}
-                }
-                
-                update_document_extraction_data(
-                    document_id,
-                    extraction_summary,
-                    confidence,
-                    False
-                )
-                
-                # Actualizar estado
-                update_document_processing_status(
-                    document_id,
-                    'textract_completado_v2',
-                    f"Extracción completada con confianza {confidence:.2f}",
-                    tipo_documento=doc_type
-                )
-                
-                log_document_processing_end(
-                    db_update_id,
-                    estado='completado',
-                    datos_procesados={"analysis_updated": update_success, "document_updated": True}
-                )
-                
-                # Enviar a procesador específico
-                queue_url = determine_processor_queue(doc_type)
-                
-                message = {
-                    'document_id': document_id,
-                    'document_type': doc_type,
-                    'confidence': confidence,
-                    'extraction_complete': True,
+            return create_error_response("Analysis ID no disponible")
+        
+        log_document_processing_end(
+            version_analysis_registro_id,
+            estado='completado',
+            datos_procesados={
+                "version_actual": version_actual,
+                "version_id": version_id,
+                "analysis_id": analysis_id
+            }
+        )
+        
+        logger.info(f"✅ IDs verificados - Documento: {document_id}, Versión: {version_actual}, Version ID: {version_id}, Analysis ID: {analysis_id}")
+        
+        # 7. ✅ OBTENER RESULTADOS DE TEXTRACT
+        textract_get_id = log_document_processing_start(
+            document_id,
+            'obtener_resultados_textract_v3',
+            datos_entrada={"job_id": job_id},
+            analisis_id=doc_registro_id
+        )
+        
+        job_type = 'DOCUMENT_TEXT_DETECTION' if '_detection' in job_tag else 'DOCUMENT_ANALYSIS'
+        textract_results, get_time = get_textract_results_safe(job_id, job_type)
+        
+        if not textract_results:
+            error_msg = f"No se pudieron obtener resultados para JobId: {job_id}"
+            raise ValueError(error_msg)
+        
+        log_document_processing_end(
+            textract_get_id,
+            estado='completado',
+            datos_procesados={"pages_obtained": len(textract_results)},
+            duracion_ms=int(get_time * 1000)
+        )
+        
+        # 8. ✅ EXTRACCIÓN COMPLETA DE DATOS
+        extraction_id = log_document_processing_start(
+            document_id,
+            'extraccion_completa_v3',
+            datos_entrada={"pages_count": len(textract_results)},
+            analisis_id=doc_registro_id
+        )
+        
+        logger.info(f"🔄 Iniciando extracción completa de datos con IDs verificados...")
+        all_extracted_data = extract_complete_data_from_textract_fixed(textract_results)
+        
+        if not all_extracted_data['extraction_success']:
+            logger.warning(f"⚠️ Extracción parcialmente exitosa")
+        
+        confidence = all_extracted_data.get('extraction_confidence', 0.5)
+        doc_type = all_extracted_data.get('doc_type_info', {}).get('document_type', 'documento')
+        
+        log_document_processing_end(
+            extraction_id,
+            estado='completado',
+            datos_procesados={
+                "extraction_success": all_extracted_data['extraction_success'],
+                "text_length": len(all_extracted_data.get('full_text', '')),
+                "confidence": confidence,
+                "doc_type": doc_type
+            },
+            duracion_ms=int(all_extracted_data.get('processing_time', 0) * 1000)
+        )
+        
+        # 9. ✅ ACTUALIZAR ANÁLISIS CON IDs VERIFICADOS
+        db_update_id = log_document_processing_start(
+            document_id,
+            'actualizar_bd_ultra_verificada',
+            datos_entrada={"analysis_id": analysis_id, "version_id": version_id},
+            analisis_id=doc_registro_id
+        )
+        
+        try:
+            # ✅ USAR FUNCIÓN DE ACTUALIZACIÓN ULTRA-VERIFICADA
+            update_success = update_analysis_record_verified(
+                analysis_id,    # ✅ ID garantizado como existente
+                all_extracted_data.get('full_text', ''),
+                json.dumps(all_extracted_data.get('structured_data', {})),
+                json.dumps({
+                    'job_id': job_id,
+                    'extraction_metadata': all_extracted_data.get('metadata', {}),
+                    'query_answers': all_extracted_data.get('query_answers', {}),
+                    'extraction_confidence': confidence,
                     'version_info': {
-                        'version_actual': version_actual,
-                        'version_id': version_id,
-                        'analysis_id': analysis_id
+                        'version_actual': version_actual, 
+                        'version_id': version_id
                     },
                     'processing_metadata': {
-                        'job_id': job_id,
-                        'extraction_success': all_extracted_data['extraction_success']
+                        'processor': 'textract_callback_v3',
+                        'job_type': job_type,
+                        'processed_at': datetime.now().isoformat()
                     }
-                }
-                
-                sqs_client.send_message(
-                    QueueUrl=queue_url,
-                    MessageBody=json.dumps(message)
-                )
-                
-                logger.info(f"📤 Documento enviado a procesador: {queue_url}")
-                
-                log_document_processing_end(
-                    doc_registro_id,
-                    estado='completado',
-                    datos_procesados={
-                        "document_type": doc_type,
-                        "confidence": confidence,
-                        "next_queue": queue_url
-                    }
-                )
-                
-            except Exception as db_error:
-                logger.error(f"❌ Error en actualización de BD: {str(db_error)}")
-                
-                log_document_processing_end(
-                    db_update_id,
-                    estado='error',
-                    mensaje_error=str(db_error)
-                )
-                
-                # Actualizar al menos el estado
-                update_document_processing_status(
-                    document_id,
-                    'error_actualizacion_bd',
-                    f"Error actualizando BD: {str(db_error)}"
-                )
-                
-                log_document_processing_end(
-                    doc_registro_id,
-                    estado='error',
-                    mensaje_error=f"Error BD: {str(db_error)}"
-                )
-        
-        elif status == 'FAILED':
-            error_message = f"Textract falló para JobId: {job_id}"
-            logger.error(f"❌ {error_message}")
+                }),
+                'textract_completado_v3',
+                f"textract-{job_type}-v3",
+                int(get_time * 1000),
+                'textract_callback_v3',
+                confidence < 0.85,
+                False,
+                mensaje_error=all_extracted_data.get('error_message'),
+                confianza_clasificacion=confidence,
+                tipo_documento=doc_type,
+                id_version=version_id  # ✅ MANTENER VINCULACIÓN VERIFICADA
+            )
             
+            if not update_success:
+                error_msg = f"CRÍTICO: update_analysis_record_verified falló para analysis_id: {analysis_id}"
+                logger.error(f"❌ {error_msg}")
+                
+                log_document_processing_end(db_update_id, estado='error', mensaje_error=error_msg)
+                raise Exception(error_msg)
+            
+            logger.info(f"✅ Análisis actualizado correctamente: {analysis_id}")
+            
+            # ✅ GUARDAR QUERY ANSWERS SI EXISTEN
+            if all_extracted_data.get('query_answers'):
+                logger.info(f"💾 Guardando query answers en análisis {analysis_id}...")
+                save_success = save_query_answers_to_analysis(analysis_id, all_extracted_data['query_answers'])
+                if save_success:
+                    logger.info(f"✅ Query answers guardadas exitosamente")
+                else:
+                    logger.warning(f"⚠️ No se pudieron guardar todas las query answers")
+            
+            # ✅ ACTUALIZAR DOCUMENTO CON DATOS EXTRAÍDOS
+            extraction_summary = {
+                'document_type': doc_type,
+                'confidence': confidence,
+                'extraction_success': all_extracted_data['extraction_success'],
+                'tables_count': len(all_extracted_data.get('tables', [])),
+                'forms_count': len(all_extracted_data.get('forms', {})),
+                'queries_count': len(all_extracted_data.get('query_answers', {})),
+                'version_info': {
+                    'version_actual': version_actual, 
+                    'version_id': version_id,
+                    'analysis_id': analysis_id
+                },
+                'processing_metadata': {
+                    'job_id': job_id,
+                    'processor': 'textract_callback_v3',
+                    'processed_at': datetime.now().isoformat(),
+                    'ids_verified': True
+                }
+            }
+            
+            update_document_extraction_data(
+                document_id,
+                extraction_summary,
+                confidence,
+                False
+            )
+            
+            # ✅ ACTUALIZAR ESTADO DE PROCESAMIENTO
             update_document_processing_status(
                 document_id,
-                'textract_fallido',
-                error_message
+                'textract_comptextract_completadoletado_v3',
+                f"Extracción completada con Textract verificado, confianza {confidence:.2f}",
+                tipo_documento=doc_type
             )
             
             log_document_processing_end(
-                doc_registro_id,
+                db_update_id,
+                estado='completado',
+                datos_procesados={
+                    "analysis_updated": True,
+                    "document_updated": True,
+                    "query_answers_saved": bool(all_extracted_data.get('query_answers')),
+                    "confidence": confidence
+                }
+            )
+            
+        except Exception as db_error:
+            logger.error(f"❌ Error en actualización de BD: {str(db_error)}")
+            
+            log_document_processing_end(
+                db_update_id,
                 estado='error',
-                mensaje_error=error_message
+                mensaje_error=str(db_error)
             )
-        
-        else:
-            logger.warning(f"⚠️ Estado inesperado: {status}")
             
-            log_document_processing_end(
-                doc_registro_id,
-                estado='advertencia',
-                mensaje_error=f"Estado inesperado: {status}"
+            # Actualizar al menos el estado
+            update_document_processing_status(
+                document_id,
+                'error_actualizacion_bd_v3',
+                f"Error actualizando BD: {str(db_error)}"
             )
+            
+            raise db_error
         
-        # Finalizar procesamiento exitoso
+        # 10. ✅ ENVIAR A PROCESADOR ESPECÍFICO
+        queue_url = determine_processor_queue(doc_type)
+        
+        message = {
+            'document_id': document_id,
+            'document_type': doc_type,
+            'confidence': confidence,
+            'extraction_complete': True,
+            'version_info': {
+                'version_actual': version_actual,
+                'version_id': version_id,
+                'analysis_id': analysis_id
+            },
+            'processing_metadata': {
+                'job_id': job_id,
+                'extraction_success': all_extracted_data['extraction_success'],
+                'processor': 'textract_callback_v3',
+                'ids_verified': True
+            }
+        }
+        
+        sqs_client.send_message(
+            QueueUrl=queue_url,
+            MessageBody=json.dumps(message)
+        )
+        
+        logger.info(f"📤 Documento enviado a procesador: {queue_url}")
+        
+        # 11. ✅ FINALIZAR PROCESAMIENTO EXITOSO
+        log_document_processing_end(
+            doc_registro_id,
+            estado='completado',
+            datos_procesados={
+                "document_type": doc_type,
+                "confidence": confidence,
+                "analysis_id": analysis_id,
+                "version_id": version_id,
+                "next_queue": queue_url,
+                "processing_verified": True
+            }
+        )
+        
         log_document_processing_end(
             callback_registro_id,
             estado='completado',
@@ -1242,17 +1364,24 @@ def lambda_handler(event, context):
                 "document_id": document_id,
                 "status": status,
                 "job_id": job_id,
-                "processed_successfully": status == 'SUCCEEDED'
+                "processed_successfully": True,
+                "analysis_id": analysis_id,
+                "version_id": version_id
             }
         )
         
+        logger.info(f"✅ Callback procesado completamente para documento {document_id}")
+ 
+
         return {
             'statusCode': 200,
             'body': json.dumps({
-                'message': 'Callback procesado exitosamente',
+                'message': 'Callback procesado exitosamente con verificación completa',
                 'document_id': document_id,
                 'status': status,
                 'job_id': job_id,
+                'analysis_id': analysis_id,
+                'version_id': version_id,
                 'timestamp': datetime.now().isoformat()
             })
         }
@@ -1267,8 +1396,8 @@ def lambda_handler(event, context):
             if 'document_id' in locals() and document_id:
                 update_document_processing_status(
                     document_id,
-                    'error_callback',
-                    f"Error en callback: {str(e)}"
+                    'error_callback_v3',
+                    f"Error en callback verificado: {str(e)}"
                 )
         except Exception:
             logger.error("No se pudo actualizar estado del documento")
@@ -1282,8 +1411,29 @@ def lambda_handler(event, context):
         return {
             'statusCode': 500,
             'body': json.dumps({
-                'error': 'Error procesando callback de Textract',
+                'error': 'Error procesando callback de Textract con verificación',
                 'message': str(e),
                 'timestamp': datetime.now().isoformat()
             })
         }
+
+
+def create_error_response(message):
+    """Crea una respuesta de error estandarizada"""
+    return {
+        'statusCode': 500,
+        'body': json.dumps({
+            'error': message,
+            'timestamp': datetime.now().isoformat()
+        })
+    }
+
+def create_success_response():
+    """Crea una respuesta de éxito estandarizada"""
+    return {
+        'statusCode': 200,
+        'body': json.dumps({
+            'message': 'Procesado exitosamente',
+            'timestamp': datetime.now().isoformat()
+        })
+    }
